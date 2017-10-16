@@ -4,8 +4,8 @@ from os.path import exists
 from os import remove, mkdir
 from urllib.request import urlretrieve
 from sys import argv
-import editdistance
 import pandas as pd
+import pdb
 import requests
 
 # Parallel scraping script designed to be run on multiple EC2 instances.
@@ -49,31 +49,16 @@ for i, row in S.iloc[i0:i1].iterrows():
     print(htm_path)
     print(mp3_path)
 
-    # Search KKBOX directly. Given the search results, pick the result
-    # with the closest title (edit distance) and time.
+    # Search KKBOX directly. Given the search results, always pick the first.
     if not exists(url_path):
         search_url = '%s%s %s' % (SEARCH_BASE, row['artist_name'], row['name'])
+        print('Search URL %s' % search_url)
         req = requests.get(search_url)
         htm = soup(req.content, 'html.parser')
-        song_items = htm.select('table.song-table tr.song-item')
-        song_url = None
-        min_dist = -1
-
-        # Compute the edit distance and time delta for each song.
-        for it in song_items:
-            title = it.select('a.song-title')[0].text.strip().lower()
-            time = it.select('td.song-time')[0].text
-            mins, secs = [int(x) for x in time.split(':')]
-            name_diff = editdistance.eval(row['name'], title)
-            time_diff = abs((mins * 60 + secs) - (row['song_length'] * 0.001))
-            dist = name_diff + time_diff
-            if dist < min_dist or min_dist < 0:
-                min_dist = dist
-                song_url = it.select('a.song-title')[0]['href']
-
+        song_item = htm.select('table.song-table tr.song-item')[0]
+        song_url = song_item.select('a.song-title')[0]['href']
         song_url = 'https://www.kkbox.com%s' % song_url
-        print('Found URL with distance %.3lf' % min_dist)
-
+        print('Song URL %s' % song_url)
         with open(url_path, 'w') as f:
             f.write('%s\n' % song_url)
 
@@ -95,6 +80,7 @@ for i, row in S.iloc[i0:i1].iterrows():
     # Extract the sample URL from the KKBOX page and download it.
     if not exists(mp3_path):
         htm = soup(htm, 'html.parser')
+        print('Page title: %s' % htm.title)
         mp3_meta = htm.find('meta', property='music:preview_url:url')
         if mp3_meta:
             mp3_url = mp3_meta['content']
