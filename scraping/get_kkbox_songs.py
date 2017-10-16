@@ -14,18 +14,12 @@ assert len(argv) == 3
 i0 = int(argv[1])
 i1 = int(argv[2])
 
-# Merge songs and extra info tables into one table.
-merged_path = 'data/songs_merged.csv'
-if not exists(merged_path):
-    S = pd.read_csv('data/songs.csv')
-    E = pd.read_csv('data/song_extra_info.csv')
-    M = pd.merge(S, E, on='song_id')
-    M.to_csv(merged_path)
-
 # Read the merged songs and keep only those that are
 # used in the training and testing datasets.
+merged_path = 'data/songs_merged.csv'
 scrape_path = 'data/songs_scrape.csv'
 if not exists(scrape_path):
+    print('Filtering songs for scraping...')
     TRN = pd.read_csv('data/train.csv')
     TST = pd.read_csv('data/test.csv')
     S = pd.read_csv(merged_path)
