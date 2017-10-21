@@ -1,0 +1,12 @@
+{
+  "dev": {
+    "api_handler_name": "kkbox-scraping-dev",
+    "api_handler_arn": "arn:aws:lambda:us-west-2:788008650827:function:kkbox-scraping-dev",
+    "lambda_functions": {},
+    "backend": "api",
+    "chalice_version": "1.0.3",
+    "rest_api_id": "xvwk49vi2a",
+    "api_gateway_stage": "api",
+    "region": "us-west-2"
+  }
+}
