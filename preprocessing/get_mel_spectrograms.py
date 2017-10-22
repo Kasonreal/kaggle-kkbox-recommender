@@ -62,7 +62,7 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=monitor, args=(len(id_todo),))
     monitor_thread.start()
 
-    nb_parallel = 6
+    nb_parallel = 3
     pool = Pool(nb_parallel)
     res = pool.map(mel_parallel, np.array_split(id_todo, nb_parallel))
 
