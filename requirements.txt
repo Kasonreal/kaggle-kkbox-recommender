@@ -1,6 +1,6 @@
 audioread==2.1.5
 beautifulsoup4==4.6.0
-bleach==2.1.1
+bleach==1.5.0
 boto3==1.4.7
 botocore==1.7.32
 bs4==0.0.1
@@ -15,7 +15,8 @@ entrypoints==0.2.3
 gevent==1.2.2
 greenlet==0.4.12
 grequests==0.3.0
-html5lib==1.0b10
+h5py==2.7.1
+html5lib==0.9999999
 idna==2.6
 ipykernel==4.6.1
 ipython==6.2.1
@@ -30,8 +31,10 @@ jupyter==1.0.0
 jupyter-client==5.1.0
 jupyter-console==5.2.0
 jupyter-core==4.3.0
+Keras==2.0.8
 librosa==0.5.1
 llvmlite==0.20.0
+Markdown==2.6.9
 MarkupSafe==1.0
 matplotlib==2.1.0
 mistune==0.7.4
@@ -48,11 +51,13 @@ pexpect==4.2.1
 pickleshare==0.7.4
 Pillow==4.3.0
 prompt-toolkit==1.0.15
+protobuf==3.4.0
 ptyprocess==0.5.2
 Pygments==2.2.0
 pyparsing==2.2.0
 python-dateutil==2.6.1
 pytz==2017.2
+PyYAML==3.12
 pyzmq==16.0.2
 qtconsole==4.3.1
 requests==2.18.4
@@ -62,8 +67,11 @@ scikit-learn==0.19.0
 scipy==0.19.1
 simplegeneric==0.8.1
 six==1.11.0
+tensorflow-gpu==1.3.0
+tensorflow-tensorboard==0.1.8
 terminado==0.6
 testpath==0.3.1
+Theano==0.9.0
 tornado==4.5.2
 tqdm==4.19.4
 traitlets==4.3.2
@@ -71,4 +79,5 @@ typing==3.5.3.0
 urllib3==1.22
 wcwidth==0.1.7
 webencodings==0.5.1
+Werkzeug==0.12.2
 widgetsnbextension==3.0.6
