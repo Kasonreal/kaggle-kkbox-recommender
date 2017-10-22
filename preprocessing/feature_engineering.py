@@ -54,10 +54,10 @@ if __name__ == "__main__":
         TST[cb] = enc.transform(TST[ca])
 
     # Add columns that will be populated.
-    TRN['dist_user_song'] = np.zeros(len(TRN))
-    TST['dist_user_song'] = np.zeros(len(TST))
-    TRN['dist_user_artist'] = np.zeros(len(TRN))
-    TST['dist_user_artist'] = np.zeros(len(TST))
+    TRN['sim_user_song'] = np.zeros(len(TRN))
+    TST['sim_user_song'] = np.zeros(len(TST))
+    TRN['sim_user_artist'] = np.zeros(len(TRN))
+    TST['sim_user_artist'] = np.zeros(len(TST))
 
     # Keep a subset of all the columns.
     keep_cols_trn = [
