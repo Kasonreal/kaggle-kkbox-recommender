@@ -53,16 +53,19 @@ def mel_parallel(id_todo):
 
 if __name__ == "__main__":
 
+    assert len(sys.argv) == 2
+    nb_parallel = int(sys.argv[1])
+
+    print('Computing missing IDs')
     pp_mp3 = glob('%s/*_sample.mp3' % READ_DIR)
     pp_jpg = glob('%s/*_melspec.jpg' % WRIT_DIR)
     id_mp3 = set([x.split('/')[-1].replace('_sample.mp3', '') for x in pp_mp3])
     id_mel = set([x.split('/')[-1].replace('_melspec.jpg', '') for x in pp_jpg])
     id_todo = list(id_mp3 - id_mel)
 
-    monitor_thread = threading.Thread(target=monitor, args=(len(id_todo),))
+    monitor_thread = threading.Thread(target=monitor, args=(len(id_mp3),))
     monitor_thread.start()
 
-    nb_parallel = 3
     pool = Pool(nb_parallel)
     res = pool.map(mel_parallel, np.array_split(id_todo, nb_parallel))
 
