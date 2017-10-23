@@ -20,7 +20,7 @@ np.random.seed(865)
 from keras.layers import Input, Embedding, Activation, dot, Lambda
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
-from keras.optimizers import Adam
+from keras.optimizers import Adam, RMSprop
 from keras.callbacks import ModelCheckpoint, CSVLogger, Callback, EarlyStopping, ReduceLROnPlateau
 from keras import backend as K
 
@@ -117,46 +117,46 @@ class CFSC(object):
         self.logger.info('Reading dataframes')
         TRN = pd.read_csv('%s/train.csv' % self.data_dir)
         TST = pd.read_csv('%s/test.csv' % self.data_dir)
-        SNG = pd.read_csv('%s/songs.csv' % self.data_dir)
-        SNG = SNG[['song_id', 'song_length', 'artist_name']]
+        # SNG = pd.read_csv('%s/songs.csv' % self.data_dir)
+        # SNG = SNG[['song_id', 'song_length', 'artist_name']]
 
-        self.logger.info('Replacing missing song IDs')
-        missing_song_ids = set(TRN['song_id'].append(TST['song_id'])) - set(SNG['song_id'])
-        SNG = SNG.append(pd.DataFrame({
-            'song_id': list(missing_song_ids),
-            'song_length': [SNG['song_length'].mean()] * len(missing_song_ids),
-            'artist_name': [SNG['artist_name'].value_counts().idxmax()] * len(missing_song_ids)
-        }))
+        # self.logger.info('Replacing missing song IDs')
+        # missing_song_ids = set(TRN['song_id'].append(TST['song_id'])) - set(SNG['song_id'])
+        # SNG = SNG.append(pd.DataFrame({
+        #     'song_id': list(missing_song_ids),
+        #     'song_length': [SNG['song_length'].mean()] * len(missing_song_ids),
+        #     'artist_name': [SNG['artist_name'].value_counts().idxmax()] * len(missing_song_ids)
+        # }))
 
-        self.logger.info('Merging train, test with songs')
-        TRN = TRN.merge(SNG, on='song_id', how='left')
-        TST = TST.merge(SNG, on='song_id', how='left')
+        # self.logger.info('Merging train, test with songs')
+        # TRN = TRN.merge(SNG, on='song_id', how='left')
+        # TST = TST.merge(SNG, on='song_id', how='left')
 
-        # Impute missing values with the most common value.
-        impute_cols = [
-            'source_system_tab',
-            'source_screen_name',
-            'source_type'
-        ]
-        for c in impute_cols:
-            self.logger.info('Imputing %s' % c)
-            cmb = TRN[c].append(TST[c])
-            val = cmb.value_counts().idxmax()
-            TRN[c].fillna(val, inplace=True)
-            TST[c].fillna(val, inplace=True)
+        # # Impute missing values with the most common value.
+        # impute_cols = [
+        #     'source_system_tab',
+        #     'source_screen_name',
+        #     'source_type'
+        # ]
+        # for c in impute_cols:
+        #     self.logger.info('Imputing %s' % c)
+        #     cmb = TRN[c].append(TST[c])
+        #     val = cmb.value_counts().idxmax()
+        #     TRN[c].fillna(val, inplace=True)
+        #     TST[c].fillna(val, inplace=True)
 
-        # Convert song length into minutes.
-        TRN['song_length'] = TRN['song_length'] / 1000. / 60.
-        TST['song_length'] = TST['song_length'] / 1000. / 60.
+        # # Convert song length into minutes.
+        # TRN['song_length'] = TRN['song_length'] / 1000. / 60.
+        # TST['song_length'] = TST['song_length'] / 1000. / 60.
 
         # Encode a subset of the columns.
         encode_cols = [
             ('msno', 'user_index'),
             ('song_id', 'song_index'),
-            ('artist_name', 'artist_index'),
-            ('source_system_tab', 'source_system_tab_index'),
-            ('source_screen_name', 'source_screen_name_index'),
-            ('source_type', 'source_type_index'),
+            # ('artist_name', 'artist_index'),
+            # ('source_system_tab', 'source_system_tab_index'),
+            # ('source_screen_name', 'source_screen_name_index'),
+            # ('source_type', 'source_type_index'),
         ]
         for ca, cb in encode_cols:
             self.logger.info('Encoding %s -> %s' % (ca, cb))
@@ -177,11 +177,11 @@ class CFSC(object):
         keep_cols_trn = [
             'user_index',
             'song_index',
-            'artist_index',
-            'source_system_tab_index',
-            'source_screen_name_index',
-            'source_type_index',
-            'song_length',
+            # 'artist_index',
+            # 'source_system_tab_index',
+            # 'source_screen_name_index',
+            # 'source_type_index',
+            # 'song_length',
             'sim_user_song',
             'sim_user_artist',
             'target'
@@ -211,81 +211,57 @@ class CFSC(object):
         TST.to_csv(self.features_path_tst, index=False)
         self.logger.info('Saved %s' % self.features_path_tst)
 
-    def _embedding_sampler(self, TRN):
-
-        # Frequency of the user, song, and artist at each row.
-        user_freqs = TRN.groupby(['user_index'])['user_index'].transform('count').values
-        song_freqs = TRN.groupby(['song_index'])['song_index'].transform('count').values
-
-        # Probability distribution for sampling with inverse probability of users and songs.
-        # Popular users and songs are sampled less frequently than in-frequent ones.
-        user_probs = 1. / user_freqs
-        user_probs /= user_probs.sum()
-        song_probs = 1. / song_freqs
-        song_probs /= song_probs.sum()
-
-        C1, C2 = Counter(), Counter()
-
-        # Yield batches sampled based on user and song probabilities.
-        # Alternate yielding samples from the user and song distributions.
-        ii = np.arange(len(TRN))
-        while True:
-            uii = np.random.choice(ii, self.embedding_steps * self.embedding_batch, p=user_probs)
-            sii = np.random.choice(ii, self.embedding_steps * self.embedding_batch, p=song_probs)
-
-            for u in TRN['user_index'][uii]:
-                C1[u] += 1
-
-            for s in TRN['song_index'][sii]:
-                C2[s] += 1
-
-            x = list(C1.values())
-            print(np.min(x), np.max(x), np.median(x))
-            x = list(C2.values())
-            print(np.min(x), np.max(x), np.median(x))
-
-            # with open('users.json', 'w') as fp:
-            #     json.dump(C1, fp, indent=2)
-            #
-            # with open('songs.json', 'w') as fp:
-            #     json.dump(C2, fp, indent=2)
-
-            for i in range(0, self.embedding_steps * self.embedding_batch, self.embedding_batch):
-                for bii in [uii[i:i + self.embedding_batch], sii[i:i + self.embedding_batch]]:
-                    X = [TRN['user_index'][bii].values, TRN['song_index'][bii].values, TRN['artist_index'][bii].values]
-                    Y = [TRN['target'][bii].values, TRN['target'][bii].values]
-                    yield X, Y
-
     def fit_embedding(self):
 
-        net_trn, net_sim = self._networks(self.embedding_size, NB_USERS, NB_SONGS, NB_ARTISTS)
+        net_trn, net_sim = self._networks(self.embedding_size, NB_USERS, NB_SONGS)
         net_trn.summary()
         net_trn.compile(loss='binary_crossentropy',
-                        optimizer=Adam(**self.embedding_optimizer_args),
+                        optimizer=RMSprop(**self.embedding_optimizer_args),
                         metrics=['accuracy'])
 
-        self.logger.info('%d users, %d songs, %d artists' % (NB_USERS, NB_SONGS, NB_ARTISTS))
+        self.logger.info('%d users, %d songs' % (NB_USERS, NB_SONGS))
 
         TRN = pd.read_csv(self.features_path_trn)
-        gen_trn = self._embedding_sampler(TRN)
+        X = [TRN['user_index'].values, TRN['song_index'].values]
+        Y = TRN['target'].values
+
+        # with open('lystdo.pkl', 'rb') as fp:
+        #     d = dill.load(fp)
+        #     u_cnt, s_cnt, uid_trn, uid_val, sid_trn, sid_val, target_trn, target_val, uid_test, sid_test, id_test = d
+
+        # pdb.set_trace()
+        # Xt = [uid_trn, sid_trn]
+        # Yt = target_trn
+        # Xv = [uid_val, sid_val]
+        # Yv = target_val
+
+        # X = [np.concatenate([uid_trn, uid_val]), np.concatenate([sid_trn, sid_val])]
+        # Y = np.concatenate([target_trn, target_val])
+
+        perm = np.random.permutation(len(Y))
+        X[0] = X[0][perm]
+        X[1] = X[1][perm]
+        Y = Y[perm]
 
         cb = [
             ModelCheckpoint(self.embedding_path,
-                            monitor='loss',
+                            monitor='val_loss',
                             save_best_only=True,
                             verbose=1,
                             mode='min'),
             CSVLogger('artifacts/usae_logs.csv'),
-            EarlyStopping(monitor='loss', patience=5, min_delta=0.002),
-            ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, epsilon=0.005, min_lr=0.0001),
+            EarlyStopping(monitor='val_loss', patience=5, min_delta=0.002),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, epsilon=0.005, min_lr=0.0001),
             # EmbeddingSummary(net_sim, X, Y, '%s/hist.png' % self.artifacts_dir),
         ]
 
-        net_trn.fit_generator(gen_trn,
-                              steps_per_epoch=self.embedding_steps,
-                              epochs=self.embedding_epochs,
-                              callbacks=cb,
-                              verbose=1)
+        net_trn.fit(X, Y,
+                    validation_split=0.15,
+                    batch_size=self.embedding_batch,
+                    epochs=self.embedding_epochs,
+                    callbacks=cb,
+                    shuffle=True,
+                    verbose=1)
 
     def fit_classifier(self):
 
@@ -358,11 +334,10 @@ class CFSC(object):
         self.logger.info('Saved %s' % self.predict_path_tst)
 
     @staticmethod
-    def _networks(embed_size, nb_users, nb_songs, nb_artists):
+    def _networks(embed_size, nb_users, nb_songs):
 
-        inp_user = Input(shape=(1,))
-        inp_song = Input(shape=(1,))
-        inp_arti = Input(shape=(1,))
+        inp_user = Input(shape=(1,), dtype='int32')
+        inp_song = Input(shape=(1,), dtype='int32')
 
         emb_users = Embedding(nb_users, embed_size, name=LAYER_NAME_USERS,
                               embeddings_initializer=RandomNormal(0, 0.01))
@@ -372,28 +347,17 @@ class CFSC(object):
                               embeddings_initializer=RandomNormal(0, 0.01))
         emb_song = emb_songs(inp_song)
 
-        emb_artis = Embedding(nb_artists, embed_size, name=LAYER_NAME_ARTISTS,
-                              embeddings_initializer=RandomNormal(0, 0.01))
-        emb_arti = emb_artis(inp_arti)
-
         dot_user_song = dot([emb_user, emb_song], axes=-1)
-        dot_user_arti = dot([emb_user, emb_arti], axes=-1)
-
         clf_user_song = Activation('sigmoid')(dot_user_song)
         clf_user_song = Lambda(lambda x: K.squeeze(x, -1), name='user_song')(clf_user_song)
-        clf_user_arti = Activation('sigmoid')(dot_user_arti)
-        clf_user_arti = Lambda(lambda x: K.squeeze(x, -1), name='user_arti')(clf_user_arti)
 
         # First network used for training.
-        net_trn = Model([inp_user, inp_song, inp_arti], [clf_user_song, clf_user_arti])
+        net_trn = Model([inp_user, inp_song], clf_user_song)
 
         # Second network used to compute similarities.
         sim_user_song = dot([emb_user, emb_song], axes=-1, normalize=True)
         sim_user_song = Lambda(lambda x: K.squeeze(x, 1))(sim_user_song)
-        sim_user_arti = dot([emb_user, emb_arti], axes=-1, normalize=True)
-        sim_user_arti = Lambda(lambda x: K.squeeze(x, 1))(sim_user_arti)
-
-        net_sim = Model([inp_user, inp_song, inp_arti], [sim_user_song, sim_user_arti])
+        net_sim = Model([inp_user, inp_song], sim_user_song)
 
         return net_trn, net_sim
 
@@ -416,11 +380,11 @@ if __name__ == "__main__":
         classifier_path='artifacts/cfsc/classifier.pkl',
         predict_path_trn='artifacts/cfsc/predict_trn.csv',
         predict_path_tst='artifacts/cfsc/predict_tst.csv',
-        embedding_size=100,
+        embedding_size=64,
         embedding_epochs=50,
-        embedding_batch=20000,
+        embedding_batch=32768,
         embedding_steps=500,
-        embedding_optimizer_args={'lr': 0.01, 'decay': 1e-4}
+        embedding_optimizer_args={'lr': 0.001}
     )
 
     model.get_features()
