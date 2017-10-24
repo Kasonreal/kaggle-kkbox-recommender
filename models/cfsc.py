@@ -221,41 +221,30 @@ class CFSC(object):
         self.logger.info('%d users, %d songs' % (NB_USERS, NB_SONGS))
 
         TRN = pd.read_csv(self.features_path_trn)
-
-        # Split such that the validation set only contains users and songs
-        # which are also in the training set.
-        user_mask = TRN.groupby(['user_index'])['user_index'].transform('count').values > 1
-        song_mask = TRN.groupby(['song_index'])['song_index'].transform('count').values > 1
-        val_cand, = np.where(user_mask * song_mask == True)
-        val_ii = np.random.choice(val_cand, int(0.1 * len(TRN)), replace=False)
-        trn_ii = np.setdiff1d(np.arange(len(TRN)), val_ii)
-        X_trn = [TRN['user_index'][trn_ii], TRN['song_index'][trn_ii], TRN['artist_index'][trn_ii]]
-        Y_trn = [TRN['target'][trn_ii], TRN['target'][trn_ii]]
-        X_val = [TRN['user_index'][val_ii], TRN['song_index'][val_ii], TRN['artist_index'][val_ii]]
-        Y_val = [TRN['target'][val_ii], TRN['target'][val_ii]]
+        X = [TRN['user_index'], TRN['song_index'], TRN['artist_index']]
+        Y = [TRN['target'], TRN['target']]
 
         cb = [
             ModelCheckpoint(self.embedding_path,
-                            monitor='val_loss',
+                            monitor='loss',
                             save_best_only=True,
                             verbose=1,
                             mode='min'),
-            # EarlyStopping(monitor='val_loss',
-            #               patience=20,
-            #               min_delta=0.002,
-            #               verbose=1),
-            ReduceLROnPlateau(monitor='val_loss',
+            EarlyStopping(monitor='loss',
+                          patience=10,
+                          min_delta=0.002,
+                          verbose=1),
+            ReduceLROnPlateau(monitor='loss',
                               factor=0.1,
-                              patience=10,
+                              patience=5,
                               epsilon=0.005,
                               min_lr=0.0001,
                               verbose=1),
-            CSVLogger('artifacts/usae_logs.csv'),
+            CSVLogger('%s/cfsc_logs.csv' % self.artifacts_dir),
             # EmbeddingSummary(net_sim, X, Y, '%s/hist.png' % self.artifacts_dir),
         ]
 
-        net_trn.fit(X_trn, Y_trn,
-                    validation_data=(X_val, Y_val),
+        net_trn.fit(X, Y,
                     batch_size=self.embedding_batch,
                     epochs=self.embedding_epochs,
                     callbacks=cb,
@@ -322,9 +311,6 @@ class CFSC(object):
         X_trn, X_val, Y_trn, Y_val = train_test_split(X, Y, test_size=0.1, random_state=np.random)
 
         self.logger.info('Training Classifier')
-        # clf = DecisionTreeClassifier(max_depth=3)
-        # clf.fit(X_trn, Y_trn)
-        # export_graphviz(clf, out_file='%s/classifier.dot' % self.artifacts_dir, class_names=True)
         clf = LogisticRegression(verbose=2)
         clf.fit(X_trn, Y_trn)
 
@@ -387,8 +373,8 @@ if __name__ == "__main__":
         classifier_path='artifacts/cfsc/classifier.pkl',
         predict_path_trn='artifacts/cfsc/predict_trn.csv',
         predict_path_tst='artifacts/cfsc/predict_tst.csv',
-        embedding_size=120,
-        embedding_epochs=50,
+        embedding_size=300,
+        embedding_epochs=200,
         embedding_batch=32000,
         embedding_optimizer_args={'lr': 0.001, 'decay': 1e-4}
     )
