@@ -2,16 +2,20 @@ from collections import Counter
 from glob import glob
 from os.path import exists
 from sklearn.preprocessing import LabelEncoder
+from time import time
 from tqdm import tqdm
 import argparse
-import dill
 import json
 import logging
 import numpy as np
 import pandas as pd
+import pickle
 import pdb
+import random
+import sys
 
 np.random.seed(865)
+random.seed(865)
 
 from keras.layers import Input, Embedding, Activation, dot, Reshape
 from keras.models import Model, load_model
@@ -44,6 +48,8 @@ class CFSC(object):
                  artifacts_dir,
                  features_path_trn,
                  features_path_tst,
+                 history_users_path,
+                 history_songs_path,
                  embedding_path,
                  predict_path_tst,
                  embedding_size,
@@ -55,6 +61,8 @@ class CFSC(object):
         self.artifacts_dir = artifacts_dir
         self.features_path_trn = features_path_trn
         self.features_path_tst = features_path_tst
+        self.history_users_path = history_users_path
+        self.history_songs_path = history_songs_path
         self.embedding_path = embedding_path
         self.predict_path_tst = predict_path_tst
         self.embedding_size = embedding_size
@@ -65,14 +73,17 @@ class CFSC(object):
 
     def get_features(self):
 
-        self.logger.info('Computing features')
-        if exists(self.features_path_trn) and exists(self.features_path_tst):
+        if exists(self.features_path_trn) \
+                and exists(self.features_path_tst) \
+                and exists(self.history_users_path) \
+                and exists(self.history_songs_path):
             self.logger.info('Features already computed')
             return
 
         self.logger.info('Reading dataframes')
         TRN = pd.read_csv('%s/train.csv' % self.data_dir)
         TST = pd.read_csv('%s/test.csv' % self.data_dir)
+
         # Encode a subset of the columns.
         encode_cols = [
             ('msno', 'user_index'),
@@ -87,27 +98,16 @@ class CFSC(object):
             TRN[cb] = pd.Series(enc.transform(TRN[ca]), dtype='category')
             TST[cb] = pd.Series(enc.transform(TST[ca]), dtype='category')
 
-        # Add similarity columns that will be populated.
-        TRN['sim_user_song'] = np.zeros(len(TRN))
-        TST['sim_user_song'] = np.zeros(len(TST))
-
         # Keep a subset of all the columns.
         self.logger.info('Removing unused columns')
         keep_cols_trn = [
             'user_index',
             'song_index',
-            'sim_user_song',
             'target'
         ]
         keep_cols_tst = ['id'] + keep_cols_trn[:-1]
         TRN = TRN[keep_cols_trn]
         TST = TST[keep_cols_tst]
-
-        # TODO: Impute users who exist in the test set but not the traning set.
-        # 3648 users accounting for 184018 records in the test set.
-
-        # TODO: Impute songs that exist in the test set but not the training set.
-        # 59873 songs accounting for 1494 records in the test set.
 
         self.logger.info('Saving dataframes')
         TRN.to_csv(self.features_path_trn, index=False)
@@ -115,53 +115,127 @@ class CFSC(object):
         TST.to_csv(self.features_path_tst, index=False)
         self.logger.info('Saved %s' % self.features_path_tst)
 
-    def fit_embedding(self):
+        CMB = TRN.append(TST)
 
-        net_clf, net_sim = self._networks(self.embedding_size)
-        net_clf.summary()
-        net_clf.compile(loss='binary_crossentropy',
+        self.logger.info('Building user -> song history')
+        gby = CMB.groupby('user_index')
+        history_users = {ui: list(gby.get_group(ui)['song_index'].values)
+                         for ui in tqdm(CMB['user_index'].unique())}
+        with open(self.history_users_path, 'wb') as fp:
+            pickle.dump(history_users, fp)
+
+        self.logger.info('Building song -> user history')
+        gby = CMB.groupby('song_index')
+        history_songs = {si: list(gby.get_group(si)['user_index'].values)
+                         for si in tqdm(CMB['song_index'].unique())}
+        with open(self.history_songs_path, 'wb') as fp:
+            pickle.dump(history_songs, fp)
+
+    def fit_sampler(self, TRN, TST, HU, HS):
+        """
+
+        """
+
+        user_index_max = max(HU.keys())
+        song_index_max = max(HS.keys())
+        N = len(TRN) // self.embedding_batch * self.embedding_batch
+        MAX_HISTORY_SIZE = 16020
+
+        while True:
+
+            # Vectorizeable variables: u1, u2, s2, s3, y1, y2, y3.
+            # Non-vectorizable variables: u3, s3 (will have to sample).
+            TRN = TRN.sample(frac=1.0)
+            U1 = TRN['user_index'].values
+            S1 = TRN['song_index'].values
+            U2 = np.random.randint(0, user_index_max, N)
+            U3 = np.random.randint(0, user_index_max, N)
+            S2 = np.random.randint(0, song_index_max, N)
+            S3 = np.random.randint(0, song_index_max, N)
+            Y1 = TRN['target'].values
+            Y2 = Y3 = np.arange(N) % 2
+            RII = np.random.randint(0, 2 * MAX_HISTORY_SIZE, N)
+
+            # Make batches.
+            for ei in range(0, N, self.embedding_batch):
+
+                X = [
+                    U1[ei:ei + self.embedding_batch],
+                    S1[ei:ei + self.embedding_batch],
+                    U2[ei:ei + self.embedding_batch],
+                    U3[ei:ei + self.embedding_batch],
+                    S2[ei:ei + self.embedding_batch],
+                    S3[ei:ei + self.embedding_batch],
+                ]
+
+                Y = [
+                    Y1[ei:ei + self.embedding_batch],
+                    Y2[ei:ei + self.embedding_batch],
+                    Y3[ei:ei + self.embedding_batch],
+                ]
+
+                rii = RII[ei:ei + self.embedding_batch]
+
+                # Sample, populate u3, s3 for this batch.
+                for bi in range(self.embedding_batch):
+
+                    u2, u3, s2, s3, ri = X[2][bi], X[3][bi], X[4][bi], X[5][bi], rii[bi]
+
+                    # if y2 = 1, set u3 to ensure that u2 and u3 share a song.
+                    # if y2 = 0, set y1 = u2 and u3 share a song.
+                    # TODO: fast way to do ^^.
+                    if Y[1][bi]:
+                        si = HU[u2][ri % len(HU[u2])]
+                        X[3][bi] = HS[si][ri % len(HS[si])]
+
+                    # if y3 = 1, set s3 to ensure that s3 and s3 share a user.
+                    # if y3 = 0, set y2 = s2 an s3 share a user.
+                    # TODO: fast way to do ^^.
+                    if Y[2][bi]:
+                        ui = HS[s2][ri % len(HS[s2])]
+                        X[5][bi] = HU[ui][ri % len(HU[ui])]
+
+                yield X, Y
+
+    def fit(self):
+
+        net_trn, net_tst = self._networks(self.embedding_size)
+        net_trn.summary()
+        net_trn.compile(loss='binary_crossentropy',
                         optimizer=Adam(**self.embedding_optimizer_args),
-                        metrics=['accuracy'])
+                        metrics=['accuracy'],
+                        loss_weights={'u1_s1': 0.5, 's2_s3': 0.25, 'u2_u3': 0.25})
 
         self.logger.info('%d users, %d songs' % (NB_USERS, NB_SONGS))
 
-        TRN = pd.read_csv(self.features_path_trn)
-        X = [TRN['user_index'], TRN['song_index']]
-        Y = TRN['target']
-
         cb = [
-            ModelCheckpoint(self.embedding_path,
-                            monitor='loss',
-                            save_best_only=True,
-                            verbose=1,
-                            mode='min'),
-            EarlyStopping(monitor='loss',
-                          patience=10,
-                          min_delta=0.002,
-                          verbose=1),
-            ReduceLROnPlateau(monitor='loss',
-                              factor=0.1,
-                              patience=5,
-                              epsilon=0.005,
-                              min_lr=0.0001,
-                              verbose=1),
+            ModelCheckpoint(self.embedding_path, monitor='loss', save_best_only=True, verbose=1, mode='min'),
+            EarlyStopping(monitor='loss', patience=10, min_delta=0.002, verbose=1),
+            ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, epsilon=0.005, min_lr=0.0001, verbose=1),
             CSVLogger('%s/cfsc_logs.csv' % self.artifacts_dir)
         ]
 
-        net_clf.fit(X, Y,
-                    batch_size=self.embedding_batch,
-                    epochs=self.embedding_epochs,
-                    callbacks=cb,
-                    verbose=1)
+        TRN = pd.read_csv(self.features_path_trn)
+        TST = pd.read_csv(self.features_path_tst)
+        with open(self.history_users_path, 'rb') as fp:
+            HU = pickle.load(fp)
+        with open(self.history_songs_path, 'rb') as fp:
+            HS = pickle.load(fp)
+
+        gen_trn = self.fit_sampler(TRN, TST, HU, HS)
+        net_trn.fit_generator(gen_trn,
+                              steps_per_epoch=len(TRN) // self.embedding_batch,
+                              epochs=self.embedding_epochs,
+                              callbacks=cb)
 
     def predict(self):
 
-        net_clf, net_sim = self._networks(self.embedding_size)
-        net_clf.load_weights(self.embedding_path, by_name=True)
+        net_trn, net_tst = self._networks(self.embedding_size)
+        net_tst.load_weights(self.embedding_path, by_name=True)
 
         TST = pd.read_csv(self.features_path_tst)
         X = [TST['user_index'], TST['song_index']]
-        Y_prd = net_clf.predict(X, batch_size=100000)
+        Y_prd = net_tst.predict(X, batch_size=100000)
 
         SUB = pd.DataFrame({'id': TST['id'], 'target': Y_prd[:, 0]})
         SUB.to_csv(self.predict_path_tst, index=False)
@@ -172,35 +246,49 @@ class CFSC(object):
     @staticmethod
     def _networks(embed_size, nb_users=NB_USERS, nb_songs=NB_SONGS):
 
-        inp_user = Input(shape=(1,))
-        inp_song = Input(shape=(1,))
+        inp_u1 = Input((1,))
+        inp_s1 = Input((1,))
+        inp_u2 = Input((1,))
+        inp_u3 = Input((1,))
+        inp_s2 = Input((1,))
+        inp_s3 = Input((1,))
 
-        emb_users = Embedding(nb_users, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
-        emb_user = emb_users(inp_user)
-        emb_user = Reshape((embed_size,))(emb_user)
+        emb_uu = Embedding(nb_users, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
+        emb_ss = Embedding(nb_songs, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
 
-        emb_songs = Embedding(nb_songs, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
-        emb_song = emb_songs(inp_song)
-        emb_song = Reshape((embed_size,))(emb_song)
+        emb_u1 = emb_uu(inp_u1)
+        emb_u2 = emb_uu(inp_u2)
+        emb_u3 = emb_uu(inp_u3)
+        emb_s1 = emb_ss(inp_s1)
+        emb_s2 = emb_ss(inp_s2)
+        emb_s3 = emb_ss(inp_s3)
 
-        dot_user_song = dot([emb_user, emb_song], axes=-1)
-        clf_user_song = Activation('sigmoid', name='user_song')(dot_user_song)
+        emb_u1 = Reshape((embed_size,))(emb_u1)
+        emb_u2 = Reshape((embed_size,))(emb_u2)
+        emb_u3 = Reshape((embed_size,))(emb_u3)
+        emb_s1 = Reshape((embed_size,))(emb_s1)
+        emb_s2 = Reshape((embed_size,))(emb_s2)
+        emb_s3 = Reshape((embed_size,))(emb_s3)
 
-        # First network used for training.
-        net_clf = Model([inp_user, inp_song], clf_user_song)
+        dot_u1_s1 = dot([emb_u1, emb_s1], axes=-1)
+        dot_u2_u3 = dot([emb_u2, emb_u3], axes=-1)
+        dot_s2_s3 = dot([emb_s2, emb_s3], axes=-1)
 
-        # Second network used to compute similarities.
-        sim_user_song = dot([emb_user, emb_song], axes=-1, normalize=True)
-        net_sim = Model([inp_user, inp_song], sim_user_song)
+        clf_u1_s1 = Activation('sigmoid', name='u1_s1')(dot_u1_s1)
+        clf_u2_u3 = Activation('sigmoid', name='u2_u3')(dot_u2_u3)
+        clf_s2_s3 = Activation('sigmoid', name='s2_s3')(dot_s2_s3)
 
-        return net_clf, net_sim
+        net_trn = Model([inp_u1, inp_s1, inp_u2, inp_u3, inp_s2, inp_s3],
+                        [clf_u1_s1, clf_u2_u3, clf_s2_s3])
+        net_tst = Model([inp_u1, inp_s1], [clf_u1_s1])
+        return net_trn, net_tst
 
 
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description='')
-    ap.add_argument('--fit_embedding', action='store_true', default=False)
+    ap.add_argument('--fit', action='store_true', default=False)
     ap.add_argument('--predict', action='store_true', default=False)
     args = vars(ap.parse_args())
 
@@ -209,18 +297,20 @@ if __name__ == "__main__":
         artifacts_dir='artifacts/cfsc',
         features_path_trn='artifacts/cfsc/features_trn.csv',
         features_path_tst='artifacts/cfsc/features_tst.csv',
+        history_users_path='artifacts/cfsc/history_users.pkl',
+        history_songs_path='artifacts/cfsc/history_songs.pkl',
         embedding_path='artifacts/cfsc/keras_embeddings_best.hdf5',
-        predict_path_tst='artifacts/cfsc/predict_tst.csv',
-        embedding_size=64,
-        embedding_epochs=20,
+        predict_path_tst='artifacts/cfsc/predict_tst_%d.csv' % int(time()),
+        embedding_size=100,
+        embedding_epochs=30,
         embedding_batch=32000,
-        embedding_optimizer_args={'lr': 0.001, 'decay': 1e-4}
+        embedding_optimizer_args={'lr': 0.01, 'decay': 1e-4}
     )
 
     model.get_features()
 
-    if args['fit_embedding']:
-        model.fit_embedding()
+    if args['fit']:
+        model.fit()
 
     if args['predict']:
         model.predict()
