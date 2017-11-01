@@ -2,6 +2,7 @@ from collections import Counter
 from glob import glob
 from os.path import exists
 from scipy.sparse import csr_matrix
+from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.neighbors import NearestNeighbors
 from time import time
@@ -17,13 +18,13 @@ import random
 import sys
 
 np.random.seed(865)
-random.seed(865)
 
 from keras.layers import Input, Embedding, Activation, dot, Reshape
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
-from keras.callbacks import ModelCheckpoint, CSVLogger, Callback, EarlyStopping, ReduceLROnPlateau
+from keras.regularizers import l2
+from keras.callbacks import ModelCheckpoint, CSVLogger, Callback, EarlyStopping, ReduceLROnPlateau, TensorBoard
 from keras import backend as K
 
 import matplotlib
@@ -38,11 +39,39 @@ NB_SONGS = 419839
 NB_ARTISTS = 46372
 
 
-class CFSC(object):
-    """
-    Content-Free Similarity Classifier.
-    Classifier that uses user, song, and artist similarities without
-    explicitly processing any content."""
+class AUC(Callback):
+
+    def __init__(self, Xt, Yt, Xv, Yv):
+        self.Xt = Xt
+        self.Yt = Yt
+        self.Xv = Xv
+        self.Yv = Yv
+
+    def on_epoch_end(self, epoch, logs={}):
+        Yp = self.model.predict(self.Xt, batch_size=1000000)
+        logs['auc'] = roc_auc_score(self.Yt, Yp)
+        Yp = self.model.predict(self.Xv, batch_size=1000000)
+        logs['val_auc'] = roc_auc_score(self.Yv, Yp)
+        print('\n', logs)
+
+
+class VecDiffs(Callback):
+
+    def __init__(self):
+        self.layers = [LAYER_NAME_USERS, LAYER_NAME_SONGS]
+
+    def on_train_begin(self, logs):
+        self.W0 = [(l, self.model.get_layer(l).get_weights()) for l in self.layers]
+
+    def on_epoch_end(self, epoch, logs):
+        for l, w0 in self.W0:
+            w1 = self.model.get_layer(l).get_weights()
+            same = np.sum(np.all(w0[0] == w1[0], axis=1))
+            print('%s: %d random vectors (%.3lf)' % (l, same, same / w0[0].shape[0]))
+
+
+class VecRec(object):
+    """Get VecRec't"""
 
     def __init__(self,
                  data_dir,
@@ -66,7 +95,7 @@ class CFSC(object):
         self.embedding_epochs = embedding_epochs
         self.embedding_batch = embedding_batch
         self.embedding_optimizer_args = embedding_optimizer_args
-        self.logger = logging.getLogger('CFSC')
+        self.logger = logging.getLogger('VecRec')
 
     def get_features(self):
 
@@ -111,22 +140,19 @@ class CFSC(object):
         ui_iv = TRN['user_index'].unique()
         ui_ov = np.setdiff1d(TST['user_index'], ui_iv)
         X = np.zeros((NB_USERS, NB_ARTISTS), dtype=np.uint8)
-        C = TRN.append(TST)
-        for ui, ai in C[['user_index', 'artist_index']].values:
+        for ui, ai in TRN.append(TST)[['user_index', 'artist_index']].values:
             X[ui, ai] += 1
 
         knn = NearestNeighbors(n_neighbors=1, metric='cosine')
         knn.fit(csr_matrix(X[ui_iv]))
         nbs = ui_iv[knn.kneighbors(csr_matrix(X[ui_ov]), return_distance=False)[:, 0]]
-        nbs_lookup = dict(zip(np.concatenate([ui_ov, ui_iv]), np.concatenate([nbs, ui_iv])))
-        TST['user_index_'] = [nbs_lookup[ui] for ui in TST['user_index']]
+        nbs = dict(zip(np.concatenate([ui_ov, ui_iv]), np.concatenate([nbs, ui_iv])))
+        TST['user_index_'] = [nbs[ui] for ui in TST['user_index']]
         assert set(TST['user_index_']) - set(TRN['user_index']) == set([])
 
         self.logger.info('Removing unused columns')
-        keep_cols_trn = ['user_index', 'song_index', 'artist_index', 'target']
-        keep_cols_tst = ['id', 'user_index', 'song_index', 'artist_index', 'user_index_']
-        TRN = TRN[keep_cols_trn]
-        TST = TST[keep_cols_tst]
+        TRN = TRN[['user_index', 'song_index', 'artist_index', 'target']]
+        TST = TST[['id', 'user_index', 'song_index', 'artist_index', 'user_index_']]
 
         self.logger.info('Saving dataframes')
         TRN.to_csv(self.features_path_trn, index=False)
@@ -134,9 +160,20 @@ class CFSC(object):
         TST.to_csv(self.features_path_tst, index=False)
         self.logger.info('Saved %s' % self.features_path_tst)
 
+    @staticmethod
+    def sgns(embed_size):
+        embs_u = Embedding(NB_USERS, embed_size, name=LAYER_NAME_USERS, embeddings_initializer=RandomNormal(0, 0.01))
+        embs_s = Embedding(NB_SONGS, embed_size, name=LAYER_NAME_SONGS, embeddings_initializer=RandomNormal(0, 0.01))
+        inp_u, inp_s = Input((1,)), Input((1,))
+        emb_u, emb_s = embs_u(inp_u), embs_s(inp_s)
+        emb_u, emb_s = Reshape((embed_size,))(emb_u), Reshape((embed_size,))(emb_s)
+        dot_u_s = dot([emb_u, emb_s], axes=-1)
+        prb_u_s = Activation('sigmoid', name='u1_s1')(dot_u_s)
+        return Model([inp_u, inp_s], prb_u_s)
+
     def fit(self):
 
-        net = self._networks(self.embedding_size)
+        net = self.sgns(self.embedding_size)
         net.summary()
         net.compile(loss='binary_crossentropy',
                     optimizer=Adam(**self.embedding_optimizer_args),
@@ -144,18 +181,38 @@ class CFSC(object):
 
         self.logger.info('%d users, %d songs' % (NB_USERS, NB_SONGS))
 
+        # Load all training data.
+        TRN = pd.read_csv(self.features_path_trn)
+
+        # Split such that all users and songs in val have >= 1 record in trn.
+        nb_trn = round(len(TRN) * 0.9)
+        freq_users = TRN.groupby(['user_index'])['user_index'].transform('count').values
+        freq_songs = TRN.groupby(['song_index'])['song_index'].transform('count').values
+        cands_val, = np.where(((freq_users > 1) * (freq_songs > 1)) == True)
+        ii_val = np.random.choice(cands_val, len(TRN) - nb_trn, replace=False)
+        ii_trn = np.setdiff1d(np.arange(len(TRN)), ii_val)
+        assert len(ii_trn) + len(ii_val) == len(TRN)
+
+        VAL = TRN.iloc[ii_val]
+        TRN = TRN.iloc[ii_trn]
+        assert len(np.intersect1d(TRN.index, VAL.index)) == 0
+
+        Xt, Yt = [TRN['user_index'], TRN['song_index']], TRN['target']
+        Xv, Yv = [VAL['user_index'], VAL['song_index']], VAL['target']
+
         cb = [
-            ModelCheckpoint(self.embedding_path, monitor='loss', save_best_only=True, verbose=1, mode='min'),
-            EarlyStopping(monitor='loss', patience=10, min_delta=0.002, verbose=1),
-            ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, epsilon=0.005, min_lr=0.0001, verbose=1),
-            CSVLogger('%s/cfsc_logs.csv' % self.artifacts_dir)
+            AUC(Xt, Yt, Xv, Yv),
+            VecDiffs(),
+            ModelCheckpoint(self.embedding_path, monitor='val_auc', save_best_only=True, verbose=1, mode='max'),
+            EarlyStopping(monitor='val_auc', patience=20, min_delta=0.001, verbose=1, mode='max'),
+            ReduceLROnPlateau(monitor='val_auc', factor=0.1, patience=10, epsilon=0.001, min_lr=0.0001, verbose=1),
+            CSVLogger('%s/vecrec_logs.csv' % self.artifacts_dir),
+            TensorBoard(log_dir=self.artifacts_dir, histogram_freq=1, batch_size=100000, write_grads=True,
+                        embeddings_freq=1, embeddings_layer_names=[LAYER_NAME_USERS, LAYER_NAME_SONGS])
         ]
 
-        TRN = pd.read_csv(self.features_path_trn)
-        X = [TRN['user_index'], TRN['song_index']]
-        Y = TRN['target']
-
-        net.fit(X, Y,
+        net.fit(Xt, Yt,
+                validation_data=(Xv, Yv),
                 batch_size=self.embedding_batch,
                 epochs=self.embedding_epochs,
                 callbacks=cb)
@@ -175,20 +232,6 @@ class CFSC(object):
         self.logger.info('Target mean %.3lf' % SUB['target'].mean())
         self.logger.info('Saved %s' % self.predict_path_tst)
 
-    @staticmethod
-    def _networks(embed_size, nb_users=NB_USERS, nb_songs=NB_SONGS):
-        inp_u1 = Input((1,))
-        inp_s1 = Input((1,))
-        emb_uu = Embedding(nb_users, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
-        emb_ss = Embedding(nb_songs, embed_size, embeddings_initializer=RandomNormal(0, 0.01))
-        emb_u1 = emb_uu(inp_u1)
-        emb_s1 = emb_ss(inp_s1)
-        emb_u1 = Reshape((embed_size,))(emb_u1)
-        emb_s1 = Reshape((embed_size,))(emb_s1)
-        dot_u1_s1 = dot([emb_u1, emb_s1], axes=-1)
-        clf_u1_s1 = Activation('sigmoid', name='u1_s1')(dot_u1_s1)
-        return Model([inp_u1, inp_s1], clf_u1_s1)
-
 
 if __name__ == "__main__":
 
@@ -198,17 +241,17 @@ if __name__ == "__main__":
     ap.add_argument('--predict', action='store_true', default=False)
     args = vars(ap.parse_args())
 
-    model = CFSC(
+    model = VecRec(
         data_dir='data',
-        artifacts_dir='artifacts/cfsc',
-        features_path_trn='artifacts/cfsc/features_trn.csv',
-        features_path_tst='artifacts/cfsc/features_tst.csv',
-        embedding_path='artifacts/cfsc/keras_embeddings_best.hdf5',
-        predict_path_tst='artifacts/cfsc/predict_tst_%d.csv' % int(time()),
-        embedding_size=100,
-        embedding_epochs=20,
-        embedding_batch=32000,
-        embedding_optimizer_args={'lr': 0.001, 'decay': 1e-4}
+        artifacts_dir='artifacts/vecrec',
+        features_path_trn='artifacts/vecrec/features_trn.csv',
+        features_path_tst='artifacts/vecrec/features_tst.csv',
+        embedding_path='artifacts/vecrec/keras_embeddings_best.hdf5',
+        predict_path_tst='artifacts/vecrec/predict_tst_%d.csv' % int(time()),
+        embedding_size=50,
+        embedding_epochs=100,
+        embedding_batch=40000,
+        embedding_optimizer_args={'lr': 0.005, 'decay': 1e-4}
     )
 
     model.get_features()
