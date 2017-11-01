@@ -207,8 +207,8 @@ class VecRec(object):
             EarlyStopping(monitor='val_auc', patience=20, min_delta=0.001, verbose=1, mode='max'),
             ReduceLROnPlateau(monitor='val_auc', factor=0.1, patience=10, epsilon=0.001, min_lr=0.0001, verbose=1),
             CSVLogger('%s/vecrec_logs.csv' % self.artifacts_dir),
-            TensorBoard(log_dir=self.artifacts_dir, histogram_freq=1, batch_size=100000, write_grads=True,
-                        embeddings_freq=1, embeddings_layer_names=[LAYER_NAME_USERS, LAYER_NAME_SONGS])
+            # TensorBoard(log_dir=self.artifacts_dir, histogram_freq=1, batch_size=100000, write_grads=True,
+            #             embeddings_freq=1, embeddings_layer_names=[LAYER_NAME_USERS, LAYER_NAME_SONGS])
         ]
 
         net.fit(Xt, Yt,
@@ -219,7 +219,7 @@ class VecRec(object):
 
     def predict(self):
 
-        net = self._networks(self.embedding_size)
+        net = self.sgns(self.embedding_size)
         net.load_weights(self.embedding_path, by_name=True)
 
         TST = pd.read_csv(self.features_path_tst)
@@ -251,7 +251,7 @@ if __name__ == "__main__":
         embedding_size=50,
         embedding_epochs=100,
         embedding_batch=40000,
-        embedding_optimizer_args={'lr': 0.005, 'decay': 1e-4}
+        embedding_optimizer_args={'lr': 0.001, 'decay': 1e-4}
     )
 
     model.get_features()
