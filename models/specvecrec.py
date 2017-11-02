@@ -250,6 +250,7 @@ class SpecVecRec(object):
 
         net, _ = self.network()
         net.summary()
+        # net.load_weights(self.model_path, by_name=True)
         if NB_GPUS > 1:
             net = make_parallel(net, NB_GPUS)
         net.compile(loss='binary_crossentropy', optimizer=Adam(**self.optimizer_args), metrics=['accuracy'])
@@ -289,7 +290,7 @@ class SpecVecRec(object):
         ]
 
         net.fit_generator(gen_trn, steps_per_epoch=steps_trn, validation_data=gen_val,
-                          validation_steps=steps_val, callbacks=cb)
+                          validation_steps=steps_val, callbacks=cb, epochs=self.epochs)
 
     def predict(self):
 
@@ -325,8 +326,8 @@ if __name__ == "__main__":
         vec_size=64,
         spec_time=500,
         spec_freq=128,
-        epochs=100,
-        batch=1700,
+        epochs=10,
+        batch=1500,
         optimizer_args={'lr': 0.001, 'decay': 1e-4},
         cache_size=100000
     )
