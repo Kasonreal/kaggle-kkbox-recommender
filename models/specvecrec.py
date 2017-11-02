@@ -1,24 +1,17 @@
-from collections import Counter
-from glob import glob
-from psutil import virtual_memory
+from hashlib import md5
+from math import ceil
 from os import getenv
 from os.path import exists
-from scipy.sparse import csr_matrix
-from sklearn.metrics import roc_auc_score
+from scipy.misc import imread
 from sklearn.preprocessing import LabelEncoder
-from sklearn.neighbors import NearestNeighbors
 from time import time
 from tqdm import tqdm
 import argparse
-import h5py
-import h5py_cache
 import json
 import logging
 import numpy as np
 import pandas as pd
-import pickle
 import pdb
-import random
 import sys
 
 np.random.seed(865)
@@ -29,7 +22,6 @@ from keras.models import Model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
 from keras.callbacks import ModelCheckpoint, CSVLogger, Callback, EarlyStopping, ReduceLROnPlateau, TensorBoard
-from keras.utils.io_utils import HDF5Matrix
 from keras import backend as K
 
 import matplotlib
@@ -54,14 +46,42 @@ SPEC_STDV = 48
 NB_GPUS = getenv('CUDA_VISIBLE_DEVICES').count(',') + 1
 
 
-def hdf5_slice(dataset, ii):
-    """HDF5 slices have to 1) use lists for indexing, 2) be sorted in ascending order. You
-    also don't want to read the same array twice if you don't have to."""
-    ii_uniq = np.unique(ii)
-    ii_sort = np.argsort(ii_uniq)
-    ii_to_new_ii = dict(zip(ii_uniq, ii_sort))
-    from_disk = dataset[ii_uniq[ii_sort].tolist(), ...]
-    return from_disk[[ii_to_new_ii[i] for i in ii]]
+class SpecReader(object):
+    """Image reader with a cache for frequent images. aka cache money."""
+
+    def __init__(self, spec_time, spec_freq, cache_paths, artifacts_dir, dtype=np.uint8):
+        self.spec_time = spec_time
+        self.spec_freq = spec_freq
+        self.dtype = dtype
+        self.path_to_index = {}
+        logger = logging.getLogger(self.__class__.__name__)
+        logger.info('Building cache with size %d' % len(cache_paths))
+        hash_ = md5(str(sorted(cache_paths)).encode()).hexdigest()
+        cache_path = '%s/spec_cache_%s.npy' % (artifacts_dir, hash_)
+        if exists(cache_path):
+            logger.info('Loading cache from disk %s' % cache_path)
+            self.cache = np.load(cache_path)
+        else:
+            self.cache = self.read(cache_paths, verbose=True)
+            np.save(cache_path, self.cache)
+            logger.info('Saved cache to disk: %s' % cache_path)
+        self.path_to_index = {p: i for i, p in enumerate(cache_paths)}
+
+    def _read_single(self, path):
+        im = imread(path)
+        if im.shape[1] < self.spec_time:
+            im = np.tile(im, ceil(self.spec_time / im.shape[1]))
+        return im.T[:self.spec_time, :self.spec_freq]
+
+    def read(self, paths, verbose=False):
+        specs = np.zeros((len(paths), self.spec_time, self.spec_freq), dtype=self.dtype)
+        iterator = tqdm(enumerate(paths)) if verbose else enumerate(paths)
+        for i, path in iterator:
+            if path in self.path_to_index:
+                specs[i] = self.cache[self.path_to_index[path]]
+            else:
+                specs[i] = self._read_single(path)
+        return specs
 
 
 class SpecVecRec(object):
@@ -72,7 +92,6 @@ class SpecVecRec(object):
                  artifacts_dir,
                  features_path_trn,
                  features_path_tst,
-                 specs_hdf5_path,
                  model_path,
                  predict_path_tst,
                  vec_size,
@@ -80,13 +99,13 @@ class SpecVecRec(object):
                  spec_freq,
                  epochs,
                  batch,
-                 optimizer_args):
+                 optimizer_args,
+                 cache_size):
 
         self.data_dir = data_dir
         self.artifacts_dir = artifacts_dir
         self.features_path_trn = features_path_trn
         self.features_path_tst = features_path_tst
-        self.specs_hdf5_path = specs_hdf5_path
         self.model_path = model_path
         self.predict_path_tst = predict_path_tst
         self.vec_size = vec_size
@@ -95,6 +114,7 @@ class SpecVecRec(object):
         self.epochs = epochs
         self.batch = batch
         self.optimizer_args = optimizer_args
+        self.cache_size = cache_size
         self.logger = logging.getLogger('VecRec')
 
     def get_features(self):
@@ -136,9 +156,38 @@ class SpecVecRec(object):
             TRN[cb] = enc.transform(TRN[ca])
             TST[cb] = enc.transform(TST[ca])
 
+        # Subset of songs that is actually used, including those from the training
+        # and testing tables which are not in the songs table.
+        SNG_ = SNG[SNG['song_id'].isin(TRN['song_id'].append(TST['song_id']))]
+        SNG_ = SNG_.append(TRN[~TRN['song_id'].isin(SNG_['song_id'])])
+        SNG_ = SNG_.append(TST[~TST['song_id'].isin(SNG_['song_id'])])
+
+        self.logger.info('Computing spectrogram paths')
+        song_id_to_path = {}
+        artist_to_paths = {x: [] for x in SNG['artist_name'].unique()}
+        check_again = []
+        for i, row in tqdm(SNG_.iterrows()):
+            hash_ = sha256(row['song_id'].encode()).hexdigest()
+            path_ = 'data/kkbox-melspecs/%s_melspec.jpg' % hash_
+            if exists(path_):
+                song_id_to_path[row['song_id']] = path_
+                artist_to_paths[row['artist_name']].append(path_)
+            else:
+                check_again.append(row)
+
+        self.logger.info('Imputing missing spectrograms for %d records' % len(check_again))
+        for row in tqdm(check_again):
+            if row['artist_name'] in artist_to_paths and len(artist_to_paths[row['artist_name']]) > 0:
+                song_id_to_path[row['song_id']] = artist_to_paths[row['artist_name']][0]
+            else:
+                song_id_to_path[row['song_id']] = artist_to_paths['Various Artists'][0]
+
+        TRN['spec_path'] = [song_id_to_path[x] for x in TRN['song_id']]
+        TST['spec_path'] = [song_id_to_path[x] for x in TST['song_id']]
+
         self.logger.info('Removing unused columns')
-        TRN = TRN[['user_index', 'song_index', 'song_id', 'artist_index', 'target']]
-        TST = TST[['id', 'user_index', 'song_index', 'song_id', 'artist_index']]
+        TRN = TRN[['user_index', 'song_index', 'spec_path', 'artist_index', 'target']]
+        TST = TST[['id', 'user_index', 'song_index', 'spec_path', 'artist_index']]
 
         self.logger.info('Saving dataframes')
         TRN.to_csv(self.features_path_trn, index=False)
@@ -146,12 +195,11 @@ class SpecVecRec(object):
         TST.to_csv(self.features_path_tst, index=False)
         self.logger.info('Saved %s' % self.features_path_tst)
 
-    @staticmethod
-    def network(spec_time, spec_freq, embed_size, nb_users):
+    def network(self):
 
         # Input for user ID and song spectrogram.
         inp_user = Input(shape=(1,))
-        inp_song = Input(shape=(spec_time, spec_freq))
+        inp_song = Input(shape=(self.spec_time, self.spec_freq))
 
         # Build the convolutional layers, based on Deep Content-based Music Recommendation (2014).
         x = Lambda(lambda x: (x - SPEC_MEAN) / SPEC_STDV)(inp_song)
@@ -177,48 +225,46 @@ class SpecVecRec(object):
         x = Dropout(0.2)(x)
         x = Dense(1024)(x)
         x = LeakyReLU()(x)
-        x = emb_song = out_song = Dense(embed_size)(x)
+        x = emb_song = out_song = Dense(self.vec_size)(x)
 
         net_song = Model(inp_song, out_song)
 
         # User-song combined embeddings network.
-        emb_users = Embedding(nb_users, embed_size, name=LAYER_NAME_USERS,
+        emb_users = Embedding(NB_USERS, self.vec_size, name=LAYER_NAME_USERS,
                               embeddings_initializer=RandomNormal(0, 0.01))
         emb_user = emb_users(inp_user)
-        emb_user = Reshape((embed_size,))(emb_user)
+        emb_user = Reshape((self.vec_size,))(emb_user)
         dot_user_song = dot([emb_user, emb_song], axes=-1, name='dot')
         classify = Activation('sigmoid', name='classify')(dot_user_song)
         net_user_song = Model([inp_user, inp_song], classify)
 
         return net_user_song, net_song
 
-    def batch_gen(self, user_indexes, specs, spec_indexes, targets, steps):
+    def batch_gen(self, steps, user_indexes, spec_paths, spec_reader, targets):
+
         while True:
             I = np.array_split(np.concatenate([
                 np.random.permutation(len(user_indexes)),
                 np.random.randint(0, len(user_indexes), steps * self.batch - len(user_indexes))
             ]), steps)
             for ii in I:
-                specs_ = hdf5_slice(specs, spec_indexes[ii])
+                specs_ = spec_reader.read(spec_paths[ii])
                 yield [user_indexes[ii], specs_], targets[ii]
 
     def fit(self):
 
-        net, _ = self.network(self.spec_time, self.spec_freq, self.vec_size, NB_USERS)
+        net, _ = self.network()
         net.summary()
         if NB_GPUS > 1:
             net = make_parallel(net, NB_GPUS)
         net.compile(loss='binary_crossentropy', optimizer=Adam(**self.optimizer_args), metrics=['accuracy'])
 
-        # Open spectrograms hdf5. 12GB cache.
-        cache = 12 * 1024 * 1024 * 1024
-        fp = h5py_cache.File(self.specs_hdf5_path, chunk_cache_mem_size=cache, w0=0.1, mode='r')
-        lookup = json.loads(fp.attrs['song_id_to_index'])
-        specs = fp.get('specs')
-
-        # Load all training data, remove records with missing songs.
+        # Load all training data.
         TRN = pd.read_csv(self.features_path_trn)
-        TRN = TRN[TRN['song_id'].isin(set(lookup.keys()))]
+
+        # Image reader that caches the most frequent images.
+        paths = TRN['spec_path'].value_counts().index.values[:self.cache_size]
+        spec_reader = SpecReader(self.spec_time, self.spec_freq, paths, self.artifacts_dir)
 
         # Split such that all users in val have >= 1 record in trn.
         nb_trn = round(len(TRN) * 0.9)
@@ -232,16 +278,13 @@ class SpecVecRec(object):
         TRN = TRN.iloc[ii_trn]
         assert len(np.intersect1d(TRN.index, VAL.index)) == 0
 
-        # Get spectrogram indexes.
-        spec_ii_trn = np.array([lookup[x] for x in TRN['song_id']])
-        spec_ii_val = np.array([lookup[x] for x in VAL['song_id']])
-
-        # Generators for training and validation. Pass reference to HDF5 array.
+        # Generators for training and validation.
         steps_trn = (len(TRN) // self.batch * self.batch + self.batch) // self.batch
         steps_val = (len(VAL) // self.batch * self.batch + self.batch) // self.batch
-
-        gen_trn = self.batch_gen(TRN['user_index'].values, specs, spec_ii_trn, TRN['target'].values, steps_trn)
-        gen_val = self.batch_gen(VAL['user_index'].values, specs, spec_ii_val, VAL['target'].values, steps_val)
+        gen_trn = self.batch_gen(steps_trn, TRN['user_index'].values, TRN['spec_path'].values,
+                                 spec_reader, TRN['target'].values)
+        gen_val = self.batch_gen(steps_val, VAL['user_index'].values, VAL['spec_path'].values,
+                                 spec_reader, VAL['target'].values)
 
         cb = [
             ModelCheckpoint(self.model_path, monitor='val_auc', save_best_only=True, verbose=1, mode='max'),
@@ -250,11 +293,8 @@ class SpecVecRec(object):
             CSVLogger('%s/vecrec_logs.csv' % self.artifacts_dir),
         ]
 
-        net.fit_generator(gen_trn,
-                          steps_per_epoch=steps_trn,
-                          validation_data=gen_val,
-                          validation_steps=steps_val,
-                          callbacks=cb)
+        net.fit_generator(gen_trn, steps_per_epoch=steps_trn, validation_data=gen_val,
+                          validation_steps=steps_val, callbacks=cb)
 
     def predict(self):
 
@@ -285,15 +325,15 @@ if __name__ == "__main__":
         artifacts_dir='artifacts/specvecrec',
         features_path_trn='artifacts/specvecrec/features_trn.csv',
         features_path_tst='artifacts/specvecrec/features_tst.csv',
-        specs_hdf5_path='data/melspecs.hdf5',
         model_path='artifacts/specvecrec/keras_embeddings_best.hdf5',
         predict_path_tst='artifacts/specvecrec/predict_tst_%d.csv' % int(time()),
         vec_size=64,
-        spec_time=1000,
+        spec_time=800,
         spec_freq=128,
         epochs=100,
         batch=1000,
-        optimizer_args={'lr': 0.001, 'decay': 1e-4}
+        optimizer_args={'lr': 0.001, 'decay': 1e-4},
+        cache_size=88000
     )
 
     model.get_features()
