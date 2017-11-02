@@ -63,8 +63,9 @@ class SpecReader(object):
         specs = np.zeros((len(paths), self.spec_time, self.spec_freq), dtype=self.dtype)
         iterator = tqdm(enumerate(paths)) if verbose else enumerate(paths)
         for i, path in iterator:
-            if path in self.path_to_index:
-                specs[i] = self.cache[self.path_to_index[path]]
+            index = self.path_to_index.get(path)
+            if index:
+                specs[i] = self.cache[index]
             else:
                 specs[i] = self._read_single(path)
         return specs
@@ -281,9 +282,9 @@ class SpecVecRec(object):
                                  spec_reader, VAL['target'].values)
 
         cb = [
-            ModelCheckpoint(self.model_path, monitor='val_auc', save_best_only=True, verbose=1, mode='max'),
-            EarlyStopping(monitor='val_auc', patience=20, min_delta=0.001, verbose=1, mode='max'),
-            ReduceLROnPlateau(monitor='val_auc', factor=0.1, patience=10, epsilon=0.001, min_lr=0.0001, verbose=1),
+            ModelCheckpoint(self.model_path, monitor='val_loss', save_best_only=True, verbose=1),
+            EarlyStopping(monitor='val_loss', patience=20, min_delta=0.001, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=10, epsilon=0.001, min_lr=0.0001, verbose=1),
             CSVLogger('%s/vecrec_logs.csv' % self.artifacts_dir),
         ]
 
@@ -327,7 +328,7 @@ if __name__ == "__main__":
         epochs=100,
         batch=1700,
         optimizer_args={'lr': 0.001, 'decay': 1e-4},
-        cache_size=95000
+        cache_size=100000
     )
 
     model.get_features()
