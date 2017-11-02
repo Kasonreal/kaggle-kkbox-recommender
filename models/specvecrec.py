@@ -56,22 +56,8 @@ class SpecReader(object):
         self.path_to_index = {}
         logger = logging.getLogger(self.__class__.__name__)
         logger.info('Building cache with size %d' % len(cache_paths))
-        hash_ = md5(str(sorted(cache_paths)).encode()).hexdigest()
-        cache_path = '%s/spec_cache_%s.npy' % (artifacts_dir, hash_)
-        if exists(cache_path):
-            logger.info('Loading cache from disk %s' % cache_path)
-            self.cache = np.load(cache_path)
-        else:
-            self.cache = self.read(cache_paths, verbose=True)
-            np.save(cache_path, self.cache)
-            logger.info('Saved cache to disk: %s' % cache_path)
+        self.cache = self.read(cache_paths, verbose=True)
         self.path_to_index = {p: i for i, p in enumerate(cache_paths)}
-
-    def _read_single(self, path):
-        im = imread(path)
-        if im.shape[1] < self.spec_time:
-            im = np.tile(im, ceil(self.spec_time / im.shape[1]))
-        return im.T[:self.spec_time, :self.spec_freq]
 
     def read(self, paths, verbose=False):
         specs = np.zeros((len(paths), self.spec_time, self.spec_freq), dtype=self.dtype)
@@ -82,6 +68,14 @@ class SpecReader(object):
             else:
                 specs[i] = self._read_single(path)
         return specs
+
+    def _read_single(self, path):
+        """Read from the center of the image. Tile the image if it is too small."""
+        im = imread(path)
+        if im.shape[1] < self.spec_time:
+            im = np.tile(im, ceil(self.spec_time / im.shape[1]))
+        cx, wx = im.shape[1] // 2, self.spec_time // 2
+        return im[:self.spec_freq, cx - wx:cx + wx].T
 
 
 class SpecVecRec(object):
@@ -223,7 +217,7 @@ class SpecVecRec(object):
         x = concatenate([global_max, global_avg])
 
         x = Dropout(0.2)(x)
-        x = Dense(1024)(x)
+        x = Dense(512)(x)
         x = LeakyReLU()(x)
         x = emb_song = out_song = Dense(self.vec_size)(x)
 
@@ -328,12 +322,12 @@ if __name__ == "__main__":
         model_path='artifacts/specvecrec/keras_embeddings_best.hdf5',
         predict_path_tst='artifacts/specvecrec/predict_tst_%d.csv' % int(time()),
         vec_size=64,
-        spec_time=800,
+        spec_time=500,
         spec_freq=128,
         epochs=100,
-        batch=1000,
+        batch=1700,
         optimizer_args={'lr': 0.001, 'decay': 1e-4},
-        cache_size=88000
+        cache_size=95000
     )
 
     model.get_features()
