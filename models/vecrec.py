@@ -162,8 +162,8 @@ class VecRec(object):
 
     @staticmethod
     def sgns(embed_size):
-        embs_u = Embedding(NB_USERS, embed_size, name=LAYER_NAME_USERS, embeddings_initializer=RandomNormal(0, 0.01))
-        embs_s = Embedding(NB_SONGS, embed_size, name=LAYER_NAME_SONGS, embeddings_initializer=RandomNormal(0, 0.01))
+        embs_u = Embedding(NB_USERS, embed_size, name=LAYER_NAME_USERS, embeddings_initializer=RandomNormal(0, 0.01), embeddings_regularizer=l2(1e-5))
+        embs_s = Embedding(NB_SONGS, embed_size, name=LAYER_NAME_SONGS, embeddings_initializer=RandomNormal(0, 0.01), embeddings_regularizer=l2(1e-5))
         inp_u, inp_s = Input((1,)), Input((1,))
         emb_u, emb_s = embs_u(inp_u), embs_s(inp_s)
         emb_u, emb_s = Reshape((embed_size,))(emb_u), Reshape((embed_size,))(emb_s)
@@ -248,7 +248,7 @@ if __name__ == "__main__":
         features_path_tst='artifacts/vecrec/features_tst.csv',
         embedding_path='artifacts/vecrec/keras_embeddings_best.hdf5',
         predict_path_tst='artifacts/vecrec/predict_tst_%d.csv' % int(time()),
-        embedding_size=50,
+        embedding_size=100,
         embedding_epochs=100,
         embedding_batch=40000,
         embedding_optimizer_args={'lr': 0.001, 'decay': 1e-4}

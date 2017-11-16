@@ -17,8 +17,7 @@ import sys
 
 np.random.seed(865)
 
-from keras.layers import Input, Embedding, Activation, Conv1D, MaxPooling1D, GlobalMaxPooling1D, GlobalAveragePooling1D, Dense, concatenate, dot, Lambda, Dropout, Reshape
-from keras.layers.advanced_activations import LeakyReLU
+from keras.layers import Input, Embedding, Activation, Dense, concatenate, dot, Dropout, Reshape
 from keras.models import Model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
@@ -36,7 +35,7 @@ class AUC(Callback):
         self.nb_trn = nb_trn
 
     def on_epoch_end(self, epoch, logs={}):
-        Yp = self.model.predict(self.X, batch_size=1000000)
+        Yp = self.model.predict(self.X, batch_size=20000)
         logs['auc'] = roc_auc_score(self.Y[:self.nb_trn], Yp[:self.nb_trn])
         logs['val_auc'] = roc_auc_score(self.Y[self.nb_trn:], Yp[self.nb_trn:])
         print('\n', logs)
@@ -188,40 +187,17 @@ class SpecVecRec(object):
         Inputs: 
         u_idx, u_cit, u_age, u_gen, 
         s_idx, s_art, s_lan, s_gen, s_yea, s_cou,
-
-        Similarity interactions representing relationships between entities.
-
-        u_idx, s_idx: user likes song?
-        u_idx, s_art: user likes artist?
-        u_idx, s_lan: user likes language?
-        u_idx, s_gen: user likes genre?
-        u_idx, s_yea: user likes year?
-        u_idx, s_cou: user likes country?
-        u_cit, s_idx: city likes song?
-        u_cit, s_art: city likes artist?
-        u_cit, s_lan: city likes language?
-        u_cit, s_gen: city likes genre?
-        u_cit, s_cou: city likes country?
-        u_age, s_idx: age likes song?
-        u_age, s_art: age likes artist?
-        u_age, s_lan: age likes language?
-        u_age, s_gen: age likes genre?
-        u_age, s_yea: age likes year?
-        u_gen, s_idx: gender likes song?
-        u_gen, s_art: gender likes artist?
-        u_gen, s_gen: gender likes genre?
         """
-
-        vecs_u_idx = Embedding(nb_u_idx, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_u_cit = Embedding(nb_u_cit, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_u_age = Embedding(nb_u_age, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_u_gen = Embedding(nb_u_gen, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_idx = Embedding(nb_s_idx, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_art = Embedding(nb_s_art, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_lan = Embedding(nb_s_lan, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_gen = Embedding(nb_s_gen, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_yea = Embedding(nb_s_yea, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
-        vecs_s_cou = Embedding(nb_s_cou, self.vec_size, embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_u_idx = Embedding(nb_u_idx, min(self.vec_size, nb_u_idx), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_u_cit = Embedding(nb_u_cit, min(self.vec_size, nb_u_cit), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_u_age = Embedding(nb_u_age, min(self.vec_size, nb_u_age), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_u_gen = Embedding(nb_u_gen, min(self.vec_size, nb_u_gen), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_idx = Embedding(nb_s_idx, min(self.vec_size, nb_s_idx), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_art = Embedding(nb_s_art, min(self.vec_size, nb_s_art), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_lan = Embedding(nb_s_lan, min(self.vec_size, nb_s_lan), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_gen = Embedding(nb_s_gen, min(self.vec_size, nb_s_gen), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_yea = Embedding(nb_s_yea, min(self.vec_size, nb_s_yea), embeddings_initializer=RandomNormal(0, 0.01))
+        vecs_s_cou = Embedding(nb_s_cou, min(self.vec_size, nb_s_cou), embeddings_initializer=RandomNormal(0, 0.01))
 
         inp_u_idx = Input(shape=(1,))
         inp_u_cit = Input(shape=(1,))
@@ -234,41 +210,25 @@ class SpecVecRec(object):
         inp_s_yea = Input(shape=(1,))
         inp_s_cou = Input(shape=(1,))
 
-        vec_u_idx = Reshape((self.vec_size,))(vecs_u_idx(inp_u_idx))
-        vec_u_cit = Reshape((self.vec_size,))(vecs_u_cit(inp_u_cit))
-        vec_u_age = Reshape((self.vec_size,))(vecs_u_age(inp_u_age))
-        vec_u_gen = Reshape((self.vec_size,))(vecs_u_gen(inp_u_gen))
-        vec_s_idx = Reshape((self.vec_size,))(vecs_s_idx(inp_s_idx))
-        vec_s_art = Reshape((self.vec_size,))(vecs_s_art(inp_s_art))
-        vec_s_lan = Reshape((self.vec_size,))(vecs_s_lan(inp_s_lan))
-        vec_s_gen = Reshape((self.vec_size,))(vecs_s_gen(inp_s_gen))
-        vec_s_yea = Reshape((self.vec_size,))(vecs_s_yea(inp_s_yea))
-        vec_s_cou = Reshape((self.vec_size,))(vecs_s_cou(inp_s_cou))
-
-        cmb = concatenate([
-            dot([vec_u_idx, vec_s_idx], axes=-1, normalize=True),  # user likes song?
-            dot([vec_u_idx, vec_s_art], axes=-1, normalize=True),  # user likes artist?
-            dot([vec_u_idx, vec_s_lan], axes=-1, normalize=True),  # user likes language?
-            dot([vec_u_idx, vec_s_gen], axes=-1, normalize=True),  # user likes genre?
-            dot([vec_u_idx, vec_s_yea], axes=-1, normalize=True),  # user likes year?
-            dot([vec_u_idx, vec_s_cou], axes=-1, normalize=True),  # user likes country?
-            dot([vec_u_cit, vec_s_idx], axes=-1, normalize=True),  # city likes song?
-            dot([vec_u_cit, vec_s_art], axes=-1, normalize=True),  # city likes artist?
-            dot([vec_u_cit, vec_s_lan], axes=-1, normalize=True),  # city likes language?
-            dot([vec_u_cit, vec_s_gen], axes=-1, normalize=True),  # city likes genre?
-            dot([vec_u_cit, vec_s_cou], axes=-1, normalize=True),  # city likes country?
-            dot([vec_u_age, vec_s_idx], axes=-1, normalize=True),  # age likes song?
-            dot([vec_u_age, vec_s_art], axes=-1, normalize=True),  # age likes artist?
-            dot([vec_u_age, vec_s_lan], axes=-1, normalize=True),  # age likes language?
-            dot([vec_u_age, vec_s_gen], axes=-1, normalize=True),  # age likes genre?
-            dot([vec_u_age, vec_s_yea], axes=-1, normalize=True),  # age likes year?
-            dot([vec_u_gen, vec_s_idx], axes=-1, normalize=True),  # gender likes song?
-            dot([vec_u_gen, vec_s_art], axes=-1, normalize=True),  # gender likes artist?
-            dot([vec_u_gen, vec_s_gen], axes=-1, normalize=True),  # gender likes genre?
+        x = concatenate([
+            vecs_u_idx(inp_u_idx),
+            vecs_u_cit(inp_u_cit),
+            vecs_u_age(inp_u_age),
+            vecs_u_gen(inp_u_gen),
+            vecs_s_idx(inp_s_idx),
+            vecs_s_art(inp_s_art),
+            vecs_s_lan(inp_s_lan),
+            vecs_s_gen(inp_s_gen),
+            vecs_s_yea(inp_s_yea),
+            vecs_s_cou(inp_s_cou),
         ])
 
-        log = Dense(1)(cmb)
-        clf = Activation('sigmoid')(log)
+        x = Dense(20, kernel_initializer='he_normal')(x)
+        x = Activation('relu')(x)
+        x = Dense(1, kernel_initializer='he_normal')(x)
+        x = Activation('sigmoid')(x)
+        x = Reshape((1,))(x)
+
         return Model([inp_u_idx,
                       inp_u_cit,
                       inp_u_age,
@@ -278,7 +238,7 @@ class SpecVecRec(object):
                       inp_s_lan,
                       inp_s_gen,
                       inp_s_yea,
-                      inp_s_cou], clf)
+                      inp_s_cou], x)
 
     def fit(self):
 
@@ -301,13 +261,14 @@ class SpecVecRec(object):
         net.compile(loss='binary_crossentropy', optimizer=Adam(**self.optimizer_args), metrics=['accuracy'])
 
         # Split such that all users and songs in val have >= 1 record in trn.
-        nb_trn = round(len(TRN) * 0.9)
+        nb_trn = round(len(TRN) * 0.8)
         freq_users = TRN.groupby(['u_idx'])['u_idx'].transform('count').values
         freq_songs = TRN.groupby(['s_idx'])['s_idx'].transform('count').values
         cands_val, = np.where(((freq_users > 1) * (freq_songs > 1)) == True)
         ii_val = np.random.choice(cands_val, len(TRN) - nb_trn, replace=False)
         ii_trn = np.setdiff1d(np.arange(len(TRN)), ii_val)
         assert len(ii_trn) + len(ii_val) == len(TRN)
+        assert len(np.intersect1d(ii_trn, ii_val)) == 0
 
         # Abuse keras validation setup.
         TRN = TRN.iloc[list(ii_trn) + list(ii_val)]
@@ -338,7 +299,7 @@ class SpecVecRec(object):
             TensorBoard(log_dir=self.artifacts_dir, histogram_freq=1, batch_size=100000, write_grads=True)
         ]
 
-        net.fit(X, Y, validation_split=0.1, epochs=self.epochs, batch_size=self.batch, callbacks=cb)
+        net.fit(X, Y, validation_split=0.2, epochs=self.epochs, batch_size=self.batch, callbacks=cb)
 
     def predict(self):
 
