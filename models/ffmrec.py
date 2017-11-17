@@ -57,8 +57,7 @@ class FFMClassifier():
             if auc_val == auc_val_max and model_path:
                 logger.info('Saving %s' % model_path)
                 ffm.save_model(model_path)
-        del ffm_data_trn
-        del ffm_data_val
+        del ffm_data_trn, ffm_data_val
         return auc_trn_max, auc_val_max, nb_epochs
 
     def predict(self, X, model_path):
@@ -111,11 +110,24 @@ class FFMRec(object):
         self.ffm_hyperparams = ffm_hyperparams
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def get_features(self):
+    def get_features(self, train=False, test=False):
 
         pptrn, pptst = glob(self.features_glob_trn), glob(self.features_glob_tst)
         if len(pptrn) and len(pptst):
-            self.logger.info('Features already computed')
+            self.logger.info('Reading features from disk.')
+            xtrn, ytrn, xtst = [], [], []
+            if train:
+                for p in tqdm(sorted(pptrn)):
+                    with open(p, 'rb') as fp:
+                        xtrn += pickle.load(fp)
+                df = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['target'])
+                ytrn = df['target'].values.tolist()
+            if test:
+                for p in tqdm(sorted(pptst)):
+                    with open(p, 'rb') as fp:
+                        xtst += pickle.load(fp)
+
+            return xtrn, ytrn, xtst
 
         self.logger.info('Reading dataframes')
         TRN = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['msno', 'song_id', 'target'])
@@ -222,9 +234,7 @@ class FFMRec(object):
 
     def hpo(self, n_splits=4, seed=423, evals=10):
 
-        self.logger.info('Reading features from disk')
-        with open(self.features_path_trn, 'r') as fp:
-            X, y = json.load(fp)
+        X, y, _ = self.get_features(train=True)
 
         # Hack semi-global variable.
         self._auc_max = 0.
