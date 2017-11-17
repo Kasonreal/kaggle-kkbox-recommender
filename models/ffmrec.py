@@ -32,7 +32,7 @@ class FFMClassifier():
                  factor_size=33,
                  learning_rate=0.09,
                  reg=0.0001,
-                 nb_epochs_max=2):
+                 nb_epochs_max=1):
 
         self.factor_size = factor_size
         self.learning_rate = learning_rate
@@ -47,13 +47,15 @@ class FFMClassifier():
         ffm.init_model(ffm_data_trn)
         auc_trn_max = auc_val_max = auc_val = nb_epochs = 0.
         while auc_val == auc_val_max and nb_epochs < self.nb_epochs_max:
-            nb_epochs += 1
+            t0 = time()
             ffm.iteration(ffm_data_trn)
+            t1 = time()
             auc_trn = roc_auc_score(y_trn, ffm.predict(ffm_data_trn))
             auc_val = roc_auc_score(y_val, ffm.predict(ffm_data_val))
-            logger.info('AUC trn: %.3lf AUC val: %.3lf' % (auc_trn, auc_val))
+            logger.info('AUC trn: %.3lf AUC val: %.3lf (%.3lf seconds)' % (auc_trn, auc_val, t1 - t0))
             auc_trn_max = max(auc_trn, auc_trn_max)
             auc_val_max = max(auc_val, auc_val_max)
+            nb_epochs += int(auc_val == auc_val_max)
             if auc_val == auc_val_max and model_path:
                 logger.info('Saving %s' % model_path)
                 ffm.save_model(model_path)
@@ -121,7 +123,7 @@ class FFMRec(object):
                     with open(p, 'rb') as fp:
                         xtrn += pickle.load(fp)
                 df = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['target'])
-                ytrn = df['target'].values.tolist()
+                ytrn = df['target'].values[:len(xtrn)].tolist()
             if test:
                 for p in tqdm(sorted(pptst)):
                     with open(p, 'rb') as fp:
@@ -241,7 +243,7 @@ class FFMRec(object):
 
         def obj(args):
             args['factor_size'] = int(args['factor_size'])
-            model = FFMClassifier(**args)
+            model = FFMClassifier(nb_epochs_max=30, **args)
             self.logger.info('%s: %d samples' % (str(model), len(X)))
             kfold = StratifiedKFold(n_splits=n_splits, random_state=seed)
             aucs, epcs = [], []
@@ -266,14 +268,13 @@ class FFMRec(object):
             return -1 * auc_mean
 
         space = {
-            'factor_size': hp.uniform('factor_size', 5, 50),
+            'factor_size': hp.uniform('factor_size', 5, 25),
             'learning_rate': hp.uniform('learning_rate', 0.09, 0.11),
         }
         best = fmin(obj, space=space, algo=tpe.suggest, max_evals=evals, rstate=np.random.RandomState(int(time())))
         self.logger.info(best, self._auc_max)
 
     def fit(self):
-        self.logger.info('Reading features from disk')
         X, y, _ = self.get_features(train=True)
         model = FFMClassifier(**self.ffm_hyperparams)
         self.logger.info(str(model))
@@ -285,6 +286,7 @@ class FFMRec(object):
         model = ffmlib.read_model(self.model_path)
         ffm_tst = ffmlib.FFMData(X, np.zeros(len(X)))
         df['target'] = model.predict(ffm_tst)
+        pdb.set_trace()
         self.logger.info('Mean target: %.3lf' % df['target'].mean())
         df.to_csv(self.predict_path_tst, index=False)
         self.logger.info('Saved %s' % self.predict_path_tst)
