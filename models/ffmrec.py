@@ -1,14 +1,13 @@
-from hashlib import md5
-from math import ceil
-from more_itertools import flatten
+from glob import glob
+from more_itertools import flatten, chunked
 from multiprocessing import Pool, cpu_count
 from os import getenv
 from os.path import exists
-from sklearn.externals import joblib
 from time import time
 from tqdm import tqdm
 import argparse
 import ffm as ffmlib
+import gc
 import json
 import logging
 import numpy as np
@@ -98,15 +97,15 @@ class FFMRec(object):
     def __init__(self,
                  data_dir,
                  artifacts_dir,
-                 features_path_trn,
-                 features_path_tst,
+                 features_glob_trn,
+                 features_glob_tst,
                  model_path,
                  predict_path_tst,
                  ffm_hyperparams):
         self.data_dir = data_dir
         self.artifacts_dir = artifacts_dir
-        self.features_path_trn = features_path_trn
-        self.features_path_tst = features_path_tst
+        self.features_glob_trn = features_glob_trn
+        self.features_glob_tst = features_glob_tst
         self.model_path = model_path
         self.predict_path_tst = predict_path_tst
         self.ffm_hyperparams = ffm_hyperparams
@@ -114,7 +113,8 @@ class FFMRec(object):
 
     def get_features(self):
 
-        if exists(self.features_path_trn) and exists(self.features_path_tst):
+        pptrn, pptst = glob(self.features_glob_trn), glob(self.features_glob_tst)
+        if len(pptrn) and len(pptst):
             self.logger.info('Features already computed')
             return
 
@@ -136,8 +136,8 @@ class FFMRec(object):
         TST = TST.merge(SNG, on='song_id', how='left')
 
         # Throw away unused after merging.
-        del SEI
-        del MMB
+        del SEI, MMB
+        gc.collect()
 
         # Impute with a common missing token.
         for c in TRN.columns[TRN.isnull().any()]:
@@ -204,29 +204,22 @@ class FFMRec(object):
             assert cold not in TRN.columns
             assert cold not in TST.columns
 
-        # Looping over existing features to convert them into [(field, index, value), ..] format.
-        # Missing data is simply left missing in this format.
-        self.logger.info('Converting features to FFM format')
+        def chunk_convert_save(df, glob_str, chunk_size=100000):
+            pool = Pool(cpu_count())
+            nb_chunks = len(df) // chunk_size + 1
+            df_chunks = np.array_split(df, nb_chunks)
+            for i in tqdm(range(nb_chunks)):
+                x = pool.map(cols_to_fields_df, np.array_split(df_chunks[i], cpu_count()))
+                p = glob_str.replace('*', str(i))
+                with open(p, 'wb') as fp:
+                    pickle.dump(list(flatten(x)), fp)
+            pool.close()
 
-        pool = Pool(cpu_count())
-        t0 = time()
-        xtrn = pool.map(cols_to_fields_df, np.array_split(TRN, cpu_count()))
-        xtrn = list(flatten(xtrn))
-        ytrn = TRN['target'].values.tolist()
+        self.logger.info('Converting train to FFM format')
+        chunk_convert_save(TRN, self.features_glob_trn)
 
-        joblib.dump((xtrn, ytrn), self.features_path_trn)
-        self.logger.info('Saved %s with %d samples' % (self.features_path_trn, len(xtrn)))
-        self.logger.info('Train elapsed: %.4lf seconds' % (time() - t0))
-        del xtrn
-        del ytrn
-
-        t0 = time()
-        xtst = pool.map(cols_to_fields_df, np.array_split(TST, cpu_count()))
-        xtst = list(flatten(xtst))
-        joblib.dump(xtst, self.features_path_tst)
-        self.logger.info('Saved %s with %d samples' % (self.features_path_tst, len(xtst)))
-        self.logger.info('Test elapsed: %.4lf seconds' % (time() - t0))
-        del xtst
+        self.logger.info('Converting test to FFM format')
+        chunk_convert_save(TST, self.features_glob_tst)
 
     def hpo(self, n_splits=4, seed=423, evals=10):
 
@@ -303,8 +296,8 @@ if __name__ == "__main__":
     model = FFMRec(
         data_dir='data',
         artifacts_dir='artifacts/ffmrec',
-        features_path_trn='artifacts/ffmrec/features_trn.pkl',
-        features_path_tst='artifacts/ffmrec/features_tst.pkl',
+        features_glob_trn='artifacts/ffmrec/features_trn_*.pkl',
+        features_glob_tst='artifacts/ffmrec/features_tst_*.pkl',
         model_path='artifacts/ffmrec/ffm_best.bin',
         predict_path_tst='artifacts/ffmrec/predict_tst_%d.csv' % int(time()),
         ffm_hyperparams={}
