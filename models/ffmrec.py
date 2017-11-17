@@ -1,7 +1,10 @@
 from hashlib import md5
 from math import ceil
+from more_itertools import flatten
+from multiprocessing import Pool, cpu_count
 from os import getenv
 from os.path import exists
+from sklearn.externals import joblib
 from time import time
 from tqdm import tqdm
 import argparse
@@ -21,26 +24,30 @@ from sklearn.model_selection import StratifiedKFold
 
 np.random.seed(865)
 
+MISSING_TOKEN = 'xxxxxxxx'
+
 
 class FFMClassifier():
 
     def __init__(self,
-                 factor_size=10,
-                 learning_rate=0.1,
-                 reg=0.0001):
+                 factor_size=33,
+                 learning_rate=0.09,
+                 reg=0.0001,
+                 nb_epochs_max=4):
 
         self.factor_size = factor_size
         self.learning_rate = learning_rate
         self.reg = reg
+        self.nb_epochs_max = nb_epochs_max
 
-    def fit(self, X_trn, y_trn, X_val, y_val, nb_epochs_max=30, model_path=None):
+    def fit(self, X_trn, y_trn, X_val, y_val, model_path=None):
         logger = logging.getLogger(str(self))
         ffm = ffmlib.FFM(eta=self.learning_rate, lam=self.reg, k=self.factor_size)
         ffm_data_trn = ffmlib.FFMData(X_trn, y_trn)
         ffm_data_val = ffmlib.FFMData(X_val, y_val)
         ffm.init_model(ffm_data_trn)
         auc_trn_max = auc_val_max = auc_val = nb_epochs = 0.
-        while auc_val == auc_val_max and nb_epochs < nb_epochs_max:
+        while auc_val == auc_val_max and nb_epochs < self.nb_epochs_max:
             nb_epochs += 1
             ffm.iteration(ffm_data_trn)
             auc_trn = roc_auc_score(y_trn, ffm.predict(ffm_data_trn))
@@ -63,8 +70,27 @@ class FFMClassifier():
         return yp
 
     def __repr__(self):
-        return '%s: %d, %.3lf, %.3lf' % \
+        return '%s: %d, %.4lf, %.4lf' % \
             (self.__class__.__name__, self.factor_size, self.learning_rate, self.reg)
+
+
+def cols_to_fields_series(series):
+    return [
+        (0, series['u_idx'], 1),
+        (1, series['s_art'], 1),
+        (2, series['u_cit'], 1),
+        (3, series['u_age'], 1),
+        (4, series['u_gen'], 1),
+        (5, series['s_idx'], 1),
+        (6, series['s_lan'], 1),
+        (7, series['s_gen'], 1),
+        (8, series['s_yea'], 1),
+        (9, series['s_cou'], 1)
+    ]
+
+
+def cols_to_fields_df(df):
+    return df.apply(cols_to_fields_series, axis=1).values.tolist()
 
 
 class FFMRec(object):
@@ -87,22 +113,92 @@ class FFMRec(object):
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def get_features(self):
+
         if exists(self.features_path_trn) and exists(self.features_path_tst):
             self.logger.info('Features already computed')
             return
 
         self.logger.info('Reading dataframes')
-        TRN = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['msno', 'song_id', 'target'], nrows=100000)
-        TST = pd.read_csv('%s/test.csv' % self.data_dir, usecols=['id', 'msno', 'song_id'], nrows=100000)
+        TRN = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['msno', 'song_id', 'target'])
+        TST = pd.read_csv('%s/test.csv' % self.data_dir, usecols=['id', 'msno', 'song_id'])
+        SNG = pd.read_csv('%s/songs.csv' % self.data_dir,
+                          usecols=['song_id', 'artist_name', 'genre_ids', 'language'])
+        SEI = pd.read_csv('%s/song_extra_info.csv' % self.data_dir, usecols=['song_id', 'isrc'])
+        MMB = pd.read_csv('%s/members.csv' % self.data_dir, usecols=['msno', 'city', 'bd', 'gender'])
 
-        cc = [('msno', 'u_idx'),
-              ('song_id', 's_idx'), ]
-        for cold, cnew in cc:
+        self.logger.info('Merge SNG and SEI.')
+        SNG = SNG.merge(SEI, on='song_id', how='left')
+
+        self.logger.info('Merge TRN and TEST with SNG and MMB.')
+        TRN = TRN.merge(MMB, on='msno', how='left')
+        TST = TST.merge(MMB, on='msno', how='left')
+        TRN = TRN.merge(SNG, on='song_id', how='left')
+        TST = TST.merge(SNG, on='song_id', how='left')
+
+        # Throw away unused after merging.
+        del SEI
+        del MMB
+
+        # Impute with a common missing token.
+        for c in TRN.columns[TRN.isnull().any()]:
+            self.logger.info('Imputing %s' % c)
+            TRN[c].fillna(MISSING_TOKEN, inplace=True)
+
+        for c in TST.columns[TST.isnull().any()]:
+            self.logger.info('Imputing %s' % c)
+            TST[c].fillna(MISSING_TOKEN, inplace=True)
+
+        assert len(TRN.columns[TRN.isnull().any()]) == 0
+        assert len(TST.columns[TST.isnull().any()]) == 0
+
+        def round_year(n, s=5):
+            try:
+                return round(int(n) / s) * s
+            except (TypeError, ValueError):
+                return n
+
+        self.logger.info('Converting ISRC to year and country')
+        TRN['country'] = TRN['isrc'].apply(lambda s: s[:2])
+        TST['country'] = TST['isrc'].apply(lambda s: s[:2])
+        TRN['year'] = TRN['isrc'].apply(lambda s: round_year(s[5:7]))
+        TST['year'] = TST['isrc'].apply(lambda s: round_year(s[5:7]))
+        TRN.drop('isrc', axis=1, inplace=True)
+        TST.drop('isrc', axis=1, inplace=True)
+
+        self.logger.info('Normalizing genres')
+        sort_genres = lambda s: '|'.join(sorted(s.split('|')))
+        TRN['genre_ids'] = TRN['genre_ids'].apply(sort_genres)
+        TST['genre_ids'] = TST['genre_ids'].apply(sort_genres)
+
+        self.logger.info('Normalizing artists')
+        sort_artists = lambda s: '|'.join(sorted(s.lower().split('| ')))
+        TRN['artist_name'] = TRN['artist_name'].apply(sort_artists)
+        TST['artist_name'] = TST['artist_name'].apply(sort_artists)
+
+        self.logger.info('Normalizing age')
+        round_age = lambda n, s=5: round(min(max(n, 0), 50) / s) * s
+        TRN['bd'] = TRN['bd'].apply(round_age)
+        TST['bd'] = TST['bd'].apply(round_age)
+
+        cc = [
+            ('msno', 'u_idx', np.uint16),
+            ('artist_name', 's_art', np.uint16),
+            ('city', 'u_cit', np.uint8),
+            ('bd', 'u_age', np.uint8),
+            ('gender', 'u_gen', np.uint8),
+
+            ('song_id', 's_idx', np.uint32),
+            ('language', 's_lan', np.uint8),
+            ('genre_ids', 's_gen', np.uint16),
+            ('year', 's_yea', np.uint8),
+            ('country', 's_cou', np.uint8),
+        ]
+        for cold, cnew, dtype in cc:
             self.logger.info('Label encoding %s -> %s' % (cold, cnew))
             enc = LabelEncoder()
             enc.fit(TRN[cold].append(TST[cold]).apply(str))
-            TRN[cnew] = enc.transform(TRN[cold].apply(str))
-            TST[cnew] = enc.transform(TST[cold].apply(str))
+            TRN[cnew] = enc.transform(TRN[cold].apply(str)).astype(dtype)
+            TST[cnew] = enc.transform(TST[cold].apply(str)).astype(dtype)
             TRN.drop(cold, axis=1, inplace=True)
             TST.drop(cold, axis=1, inplace=True)
             assert cold not in TRN.columns
@@ -112,26 +208,31 @@ class FFMRec(object):
         # Missing data is simply left missing in this format.
         self.logger.info('Converting features to FFM format')
 
-        def cols_to_fields(row):
-            return [(i, row[c], 1) for i, (_, c) in enumerate(cc)]
-
-        xtrn = TRN.apply(cols_to_fields, axis=1).values.tolist()
-        xtst = TST.apply(cols_to_fields, axis=1).values.tolist()
+        pool = Pool(cpu_count())
+        t0 = time()
+        xtrn = pool.map(cols_to_fields_df, np.array_split(TRN, cpu_count()))
+        xtrn = list(flatten(xtrn))
         ytrn = TRN['target'].values.tolist()
 
-        self.logger.info('Pickling, saving features')
-        with open(self.features_path_trn, 'wb') as fp:
-            pickle.dump((xtrn, ytrn), fp)
+        joblib.dump((xtrn, ytrn), self.features_path_trn)
         self.logger.info('Saved %s with %d samples' % (self.features_path_trn, len(xtrn)))
-        with open(self.features_path_tst, 'wb') as fp:
-            pickle.dump((xtst, None), fp)
+        self.logger.info('Train elapsed: %.4lf seconds' % (time() - t0))
+        del xtrn
+        del ytrn
+
+        t0 = time()
+        xtst = pool.map(cols_to_fields_df, np.array_split(TST, cpu_count()))
+        xtst = list(flatten(xtst))
+        joblib.dump(xtst, self.features_path_tst)
         self.logger.info('Saved %s with %d samples' % (self.features_path_tst, len(xtst)))
+        self.logger.info('Test elapsed: %.4lf seconds' % (time() - t0))
+        del xtst
 
     def hpo(self, n_splits=4, seed=423, evals=10):
 
         self.logger.info('Reading features from disk')
-        with open(self.features_path_trn, 'rb') as fp:
-            X, y = pickle.load(fp)
+        with open(self.features_path_trn, 'r') as fp:
+            X, y = json.load(fp)
 
         # Hack semi-global variable.
         self._auc_max = 0.
@@ -163,27 +264,27 @@ class FFMRec(object):
             return -1 * auc_mean
 
         space = {
-            'factor_size': hp.uniform('factor_size', 4, 100),
-            'learning_rate': hp.uniform('learning_rate', 0.01, 0.1),
-            'reg': hp.uniform('reg', 1e-5, 1e-4),
+            'factor_size': hp.uniform('factor_size', 5, 50),
+            'learning_rate': hp.uniform('learning_rate', 0.09, 0.11),
+            'reg': hp.uniform('reg', 1e-4, 1e-4),
         }
         best = fmin(obj, space=space, algo=tpe.suggest, max_evals=evals, rstate=np.random.RandomState(int(time())))
-        print(best, self._auc_max)
+        self.logger.info(best, self._auc_max)
 
     def fit(self):
         self.logger.info('Reading features from disk')
-        with open(self.features_path_trn, 'rb') as fp:
-            X, y = pickle.load(fp)
+        with open(self.features_path_trn, 'r') as fp:
+            X, y = json.load(fp)
         model = FFMClassifier(**self.ffm_hyperparams)
         self.logger.info(str(model))
-        model.fit(X, y, X, y, self.model_path)
+        model.fit(X, y, X, y, model_path=self.model_path)
 
     def predict(self):
         df = pd.read_csv('%s/test.csv' % self.data_dir, usecols=['id'])
-        with open(self.features_path_tst, 'rb') as fp:
-            XTST, _ = pickle.load(fp)
-        model = ffm.read_model(self.model_path)
-        ffm_tst = ffm.FFMData(XTST, np.zeros(len(XTST)))
+        with open(self.features_path_tst, 'r') as fp:
+            XTST, _ = json.load(fp)
+        model = ffmlib.read_model(self.model_path)
+        ffm_tst = ffmlib.FFMData(XTST, np.zeros(len(XTST)))
         df['target'] = model.predict(ffm_tst)
         self.logger.info('Mean target: %.3lf' % df['target'].mean())
         df.to_csv(self.predict_path_tst, index=False)
@@ -214,8 +315,8 @@ if __name__ == "__main__":
     if args['hpo']:
         model.hpo()
 
-    # if args['fit']:
-    #     model.fit()
+    if args['fit']:
+        model.fit()
 
-    # if args['predict']:
-    #     model.predict()
+    if args['predict']:
+        model.predict()
