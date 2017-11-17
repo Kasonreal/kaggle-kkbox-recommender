@@ -32,7 +32,7 @@ class FFMClassifier():
                  factor_size=33,
                  learning_rate=0.09,
                  reg=0.0001,
-                 nb_epochs_max=4):
+                 nb_epochs_max=2):
 
         self.factor_size = factor_size
         self.learning_rate = learning_rate
@@ -268,25 +268,22 @@ class FFMRec(object):
         space = {
             'factor_size': hp.uniform('factor_size', 5, 50),
             'learning_rate': hp.uniform('learning_rate', 0.09, 0.11),
-            'reg': hp.uniform('reg', 1e-4, 1e-4),
         }
         best = fmin(obj, space=space, algo=tpe.suggest, max_evals=evals, rstate=np.random.RandomState(int(time())))
         self.logger.info(best, self._auc_max)
 
     def fit(self):
         self.logger.info('Reading features from disk')
-        with open(self.features_path_trn, 'r') as fp:
-            X, y = json.load(fp)
+        X, y, _ = self.get_features(train=True)
         model = FFMClassifier(**self.ffm_hyperparams)
         self.logger.info(str(model))
         model.fit(X, y, X, y, model_path=self.model_path)
 
     def predict(self):
         df = pd.read_csv('%s/test.csv' % self.data_dir, usecols=['id'])
-        with open(self.features_path_tst, 'r') as fp:
-            XTST, _ = json.load(fp)
+        _, _, X = self.get_features(test=True)
         model = ffmlib.read_model(self.model_path)
-        ffm_tst = ffmlib.FFMData(XTST, np.zeros(len(XTST)))
+        ffm_tst = ffmlib.FFMData(X, np.zeros(len(X)))
         df['target'] = model.predict(ffm_tst)
         self.logger.info('Mean target: %.3lf' % df['target'].mean())
         df.to_csv(self.predict_path_tst, index=False)
