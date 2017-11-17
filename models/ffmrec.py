@@ -116,7 +116,6 @@ class FFMRec(object):
         pptrn, pptst = glob(self.features_glob_trn), glob(self.features_glob_tst)
         if len(pptrn) and len(pptst):
             self.logger.info('Features already computed')
-            return
 
         self.logger.info('Reading dataframes')
         TRN = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['msno', 'song_id', 'target'])
@@ -210,7 +209,7 @@ class FFMRec(object):
             df_chunks = np.array_split(df, nb_chunks)
             for i in tqdm(range(nb_chunks)):
                 x = pool.map(cols_to_fields_df, np.array_split(df_chunks[i], cpu_count()))
-                p = glob_str.replace('*', str(i))
+                p = glob_str.replace('*', '%03d' % i)
                 with open(p, 'wb') as fp:
                     pickle.dump(list(flatten(x)), fp)
             pool.close()
