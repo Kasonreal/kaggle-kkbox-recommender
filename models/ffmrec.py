@@ -29,9 +29,9 @@ MISSING_TOKEN = 'xxxxxxxx'
 class FFMClassifier():
 
     def __init__(self,
-                 factor_size=33,
-                 learning_rate=0.09,
-                 reg=0.0001,
+                 factor_size=9,
+                 learning_rate=0.0329,
+                 reg=0.000475,
                  nb_epochs_max=1):
 
         self.factor_size = factor_size
@@ -59,7 +59,7 @@ class FFMClassifier():
             if auc_val == auc_val_max and model_path:
                 logger.info('Saving %s' % model_path)
                 ffm.save_model(model_path)
-        del ffm_data_trn, ffm_data_val
+        del ffm, ffm_data_trn, ffm_data_val
         return auc_trn_max, auc_val_max, nb_epochs
 
     def predict(self, X, model_path):
@@ -234,7 +234,7 @@ class FFMRec(object):
         self.logger.info('Converting test to FFM format')
         chunk_convert_save(TST, self.features_glob_tst)
 
-    def hpo(self, n_splits=4, seed=423, evals=10):
+    def hpo(self, n_splits=4, seed=865, evals=100):
 
         X, y, _ = self.get_features(train=True)
 
@@ -268,8 +268,9 @@ class FFMRec(object):
             return -1 * auc_mean
 
         space = {
-            'factor_size': hp.uniform('factor_size', 5, 25),
-            'learning_rate': hp.uniform('learning_rate', 0.09, 0.11),
+            'factor_size': hp.uniform('factor_size', 4, 100),
+            'learning_rate': hp.uniform('learning_rate', 0.001, 0.4),
+            'reg': hp.uniform('reg', 1e-5, 1e-3),
         }
         best = fmin(obj, space=space, algo=tpe.suggest, max_evals=evals, rstate=np.random.RandomState(int(time())))
         self.logger.info(best, self._auc_max)
@@ -286,7 +287,6 @@ class FFMRec(object):
         model = ffmlib.read_model(self.model_path)
         ffm_tst = ffmlib.FFMData(X, np.zeros(len(X)))
         df['target'] = model.predict(ffm_tst)
-        pdb.set_trace()
         self.logger.info('Mean target: %.3lf' % df['target'].mean())
         df.to_csv(self.predict_path_tst, index=False)
         self.logger.info('Saved %s' % self.predict_path_tst)

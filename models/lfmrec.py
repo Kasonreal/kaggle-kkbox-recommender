@@ -179,20 +179,20 @@ class LFMRec(object):
 
     def fit(self):
 
-        UI, SI, Y, II, UF, SF = self.get_features(train=True)
+        _, _, _, II, UF, SF = self.get_features(train=True)
         II_trn, II_val = random_train_test_split(II, test_percentage=0.2)
 
-        model = LightFM(no_components=20, loss='logistic')
+        model = LightFM(no_components=20, loss='logistic', learning_rate=0.1)
 
-        t0 = time()
-        model.fit(II_trn, UF, SF, epochs=2, num_threads=cpu_count(), verbose=True)
-        print(time() - t0)
-
-        t0 = time()
-        train_auc = auc_score(model, II_val, user_features=UF, item_features=SF, num_threads=cpu_count()).mean()
-        print(time() - t0)
-
-        pdb.set_trace()
+        for i in range(10):
+            t0 = time()
+            model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=cpu_count(), verbose=False)
+            yp_trn = model.predict(II_trn.row, II_trn.col, item_features=SF, user_features=UF, num_threads=cpu_count())
+            yp_val = model.predict(II_val.row, II_val.col, item_features=SF, user_features=UF, num_threads=cpu_count())
+            auc_trn = roc_auc_score(II_trn.data, yp_trn)
+            auc_val = roc_auc_score(II_val.data, yp_val)
+            self.logger.info('Epoch %d: AUC trn = %.3lf, AUC val = %.3lf (%.2lf seconds)' %
+                             (i, auc_trn, auc_val, time() - t0))
 
 
 if __name__ == "__main__":
