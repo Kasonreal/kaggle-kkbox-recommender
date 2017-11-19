@@ -7,7 +7,6 @@ from os.path import exists
 from pprint import pformat
 from scipy.sparse import coo_matrix, csr_matrix, save_npz, load_npz
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import KFold
 from time import time
 import argparse
 import json
@@ -202,12 +201,14 @@ class LFMRec(object):
         _rng.shuffle(hpgrid)
 
         nb_folds = 5
-        skfolds = KFold(nb_folds, shuffle=True)
         epochs_max = 100
         patience = 5
         auc_min_delta = 0.01
         auc_mean_max = 0
         best_params = None
+
+        ii = np.random.permutation(len(II.data))
+        b = len(ii) // nb_folds
 
         for l2, opt, lr, nc in hpgrid:
             params = {'no_components': nc,
@@ -217,9 +218,11 @@ class LFMRec(object):
                       'learning_schedule': opt}
             self.logger.info('\n%s' % pformat(params))
             auc_val_mean = epochs_mean = 0
-            for i, (ii_trn, ii_val) in enumerate(skfolds.split(II.data, II.data)):
+            for i in range(nb_folds):
                 self.logger.info('Fold %d / %d' % (i + 1, nb_folds))
                 model = LightFM(loss='logistic', **params)
+                ii_val = ii[i * b: (i + 1) * b]
+                ii_trn = np.setdiff1d(ii, ii_val)
                 II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
                 II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
                 auc_val = auc_val_max = epochs = lteqmax = 0
