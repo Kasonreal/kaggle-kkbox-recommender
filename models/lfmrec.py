@@ -226,13 +226,14 @@ class LFMRec(object):
                                      (epochs, auc_trn, auc_val, time() - t0))
                     epochs += 1
                 auc_val_mean += auc_val_max / nb_folds
-                epochs_mean += epochs / nb_folds
+                epochs_mean += (epochs - ltmax) / nb_folds
+                self.logger.info('*' * 10)
 
             self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
 
             if auc_val_mean > auc_val_mean_max:
                 auc_val_mean_max = auc_val_mean
-                best_hp = (nc, lr, a, opt, epochs_mean)
+                best_hp = (nc, lr, a, opt, round(epochs_mean, 2))
 
             self.logger.info('*' * 80)
             self.logger.info('Best AUC mean so far = %.3lf' % auc_val_mean_max)
