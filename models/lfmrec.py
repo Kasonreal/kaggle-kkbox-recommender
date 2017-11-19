@@ -191,23 +191,24 @@ class LFMRec(object):
 
         II, UF, SF = self.get_features(train=True)
 
-        hpgrid = product(
-            range(10, 160, 20),
-            [10**x for x in range(-4, -1)],
+        hpgrid = list(product(
             [0] + [10**x for x in range(-6, -3)],
-            ['adadelta', 'adagrad']
-        )
+            range(10, 160, 20),
+            ['adagrad', 'adadelta'],
+            [10**x for x in range(-4, -1)],
+        ))
 
+        epochs_max = 100
         nb_folds = 5
         skfolds = StratifiedKFold(nb_folds)
         auc_val_mean_max = 0
         best_hp = None
 
-        for nc, lr, a, opt in hpgrid:
+        for l2, nc, opt, lr in hpgrid:
             params = {'no_components': nc,
                       'learning_rate': lr,
-                      'item_alpha': a,
-                      'user_alpha': a,
+                      'item_alpha': l2,
+                      'user_alpha': l2,
                       'learning_schedule': opt}
             self.logger.info('\n%s' % pformat(params))
             auc_val_mean = epochs_mean = 0
@@ -217,7 +218,7 @@ class LFMRec(object):
                 II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
                 II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
                 auc_val = auc_val_max = epochs = ltmax = 0
-                while ltmax < 3:
+                while ltmax < 3 and epochs < epochs_max:
                     t0 = time()
                     model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=NTH)
                     yp_trn = model.predict(II_trn.row, II_trn.col, SF, UF, num_threads=NTH)
