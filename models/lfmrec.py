@@ -7,7 +7,7 @@ from os.path import exists
 from pprint import pformat
 from scipy.sparse import coo_matrix, csr_matrix, save_npz, load_npz
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold
 from time import time
 import argparse
 import json
@@ -202,7 +202,7 @@ class LFMRec(object):
         _rng.shuffle(hpgrid)
 
         nb_folds = 5
-        skfolds = StratifiedKFold(nb_folds)
+        skfolds = KFold(nb_folds, shuffle=True)
         epochs_max = 100
         patience = 5
         auc_min_delta = 0.01
