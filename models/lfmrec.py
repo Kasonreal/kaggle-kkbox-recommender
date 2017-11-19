@@ -201,10 +201,12 @@ class LFMRec(object):
         _rng = np.random.RandomState(int(time()))
         _rng.shuffle(hpgrid)
 
-        epochs_max = 100
         nb_folds = 5
         skfolds = StratifiedKFold(nb_folds)
-        auc_val_mean_max = 0
+        epochs_max = 100
+        patience = 5
+        auc_min_delta = 0.01
+        auc_mean_max = 0
         best_params = None
 
         for l2, opt, lr, nc in hpgrid:
@@ -220,39 +222,40 @@ class LFMRec(object):
                 model = LightFM(loss='logistic', **params)
                 II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
                 II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
-                auc_val = auc_val_max = epochs = ltmax = 0
-                while ltmax < 3 and epochs < epochs_max:
+                auc_val = auc_val_max = epochs = lteqmax = 0
+                while lteqmax < patience and epochs < epochs_max:
                     t0 = time()
                     model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=NTH)
                     yp_trn = model.predict(II_trn.row, II_trn.col, SF, UF, num_threads=NTH)
                     yp_val = model.predict(II_val.row, II_val.col, SF, UF, num_threads=NTH)
                     auc_trn = roc_auc_score(II_trn.data, sigmoid(yp_trn))
                     auc_val = roc_auc_score(II_val.data, sigmoid(yp_val))
+                    improved = auc_val - auc_min_delta > auc_val_max
+                    lteqmax = 0 if improved else lteqmax + 1
                     auc_val_max = max(auc_val_max, auc_val)
-                    ltmax = 0 if auc_val == auc_val_max else ltmax + 1
                     self.logger.info('Epoch %d: trn = %.3lf val = %.3lf (%d sec)' %
                                      (epochs, auc_trn, auc_val, time() - t0))
                     epochs += 1
                 auc_val_mean += auc_val_max / nb_folds
-                epochs_mean += (epochs - ltmax) / nb_folds
+                epochs_mean += (epochs - lteqmax) / nb_folds
 
-                if auc_val_max < 0.63:
+                if auc_val_max < 0.65:
                     break
 
             self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
 
-            if auc_val_mean >= auc_val_mean_max:
-                auc_val_mean_max = auc_val_mean
+            if auc_val_mean >= auc_mean_max:
+                auc_mean_max = auc_val_mean
                 best_params = params
                 params['epochs'] = round(epochs_mean, 3)
 
             self.logger.info('-' * 80)
-            self.logger.info('Best AUC mean so far = %.3lf' % auc_val_mean_max)
+            self.logger.info('Best AUC mean so far = %.3lf' % auc_mean_max)
             self.logger.info('Best params so far:\n%s' % pformat(best_params))
             self.logger.info('-' * 80)
 
             fp = open('%s/search-params.txt' % self.artifacts_dir, 'w')
-            fp.write('%.3lf\n%s\n' % (auc_val_mean_max, pformat(best_params)))
+            fp.write('%.3lf\n%s\n' % (auc_mean_max, pformat(best_params)))
             fp.close()
 
     def fit(self):
