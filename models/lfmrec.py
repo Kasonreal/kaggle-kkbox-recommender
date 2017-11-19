@@ -1,24 +1,27 @@
 from lightfm import LightFM
-from lightfm.evaluation import auc_score
 from lightfm.cross_validation import random_train_test_split
 from multiprocessing import cpu_count
 from more_itertools import flatten
-from os import getenv
 from os.path import exists
 from scipy.sparse import coo_matrix, csr_matrix, save_npz, load_npz
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import LabelEncoder
 from time import time
-from tqdm import tqdm
 import argparse
 import json
 import logging
 import numpy as np
 import pandas as pd
+import pickle
 import pdb
 import sys
 
+NTH = cpu_count()
+
 np.random.seed(865)
+
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
 
 
 class LFMRec(object):
@@ -26,21 +29,25 @@ class LFMRec(object):
 
     def __init__(self,
                  data_dir,
-                 artifacts_dir):
+                 artifacts_dir,
+                 best_model_path,
+                 predict_path):
 
         self.data_dir = data_dir
         self.artifacts_dir = artifacts_dir
+        self.best_model_path = best_model_path
+        self.predict_path = predict_path
         self.logger = logging.getLogger('VecRec')
 
-    def get_features(self, train=True, test=False):
-        """
-        """
+    def get_features(self, train=False, test=False):
 
         def round_to(n, r):
             return round(n / r) * r
 
         def song_to_tags(row):
             tags = []
+
+            tags.append('song:%s' % row['song_id'])
 
             if type(row['artist_name']) == str:
                 tags += ['artist:%s' % x for x in row['artist_name'].lower().split('|')]
@@ -57,9 +64,10 @@ class LFMRec(object):
 
             return tags
 
-        def user_to_tags(row, train=False, test=False):
+        def user_to_tags(row):
             tags = []
 
+            tags.append('user:%s' % row['msno'])
             tags.append('age:%d' % round_to(np.clip(row['bd'], 0, 50), 5))
 
             if not np.isnan(row['city']):
@@ -77,21 +85,21 @@ class LFMRec(object):
         path_songfeatures = '%s/data-songfeatures.npz' % self.artifacts_dir
 
         def read_return():
-            with open(path_users_id2idx, 'r') as fp:
-                uid2idx = json.load(fp)
-            with open(path_songs_id2idx, 'r') as fp:
-                sid2idx = json.load(fp)
+            assert train or test
             UF = load_npz(path_userfeatures)
             SF = load_npz(path_songfeatures)
             if train:
-                TRN = pd.read_csv('%s/train.csv' % self.data_dir, usecols=['msno', 'song_id', 'target'])
-                UI = [uid2idx.get(x) for x in TRN['msno']]
-                SI = [sid2idx.get(x) for x in TRN['song_id']]
                 II = load_npz(path_interactions)
-                return UI, SI, TRN['target'].values, II, UF, SF
-
+                return II, UF, SF
             if test:
-                assert True == False, "Implement Me!"
+                TST = pd.read_csv('%s/test.csv' % self.data_dir, usecols=['msno', 'song_id'])
+                with open(path_users_id2idx, 'r') as fp:
+                    users_id2idx = json.load(fp)
+                with open(path_songs_id2idx, 'r') as fp:
+                    songs_id2idx = json.load(fp)
+                UI = np.array([users_id2idx[x] for x in TST['msno']])
+                SI = np.array([songs_id2idx[x] for x in TST['song_id']])
+                return UI, SI, UF, SF
 
         if exists(path_interactions) and \
                 exists(path_userfeatures) and \
@@ -179,20 +187,47 @@ class LFMRec(object):
 
     def fit(self):
 
-        _, _, _, II, UF, SF = self.get_features(train=True)
-        II_trn, II_val = random_train_test_split(II, test_percentage=0.2)
+        II, UF, SF = self.get_features(train=True)
+        model = LightFM(no_components=100, loss='logistic', learning_rate=0.1, item_alpha=1e-4, user_alpha=1e-4)
 
-        model = LightFM(no_components=20, loss='logistic', learning_rate=0.1)
+        # II_trn, II_val = random_train_test_split(II, test_percentage=0.2, random_state=np.random)
+        # for i in range(100):
+        #     t0 = time()
+        #     model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=cpu_count(), verbose=False)
+        #     yp_trn = model.predict(II_trn.row, II_trn.col, item_features=SF, user_features=UF, num_threads=cpu_count())
+        #     yp_val = model.predict(II_val.row, II_val.col, item_features=SF, user_features=UF, num_threads=cpu_count())
+        #     auc_trn = roc_auc_score(II_trn.data, sigmoid(yp_trn))
+        #     auc_val = roc_auc_score(II_val.data, sigmoid(yp_val))
+        #     self.logger.info('Epoch %d: AUC trn = %.3lf, AUC val = %.3lf (%.2lf seconds)' %
+        #                      (i, auc_trn, auc_val, time() - t0))
 
-        for i in range(10):
+        for i in range(4):
             t0 = time()
-            model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=cpu_count(), verbose=False)
-            yp_trn = model.predict(II_trn.row, II_trn.col, item_features=SF, user_features=UF, num_threads=cpu_count())
-            yp_val = model.predict(II_val.row, II_val.col, item_features=SF, user_features=UF, num_threads=cpu_count())
-            auc_trn = roc_auc_score(II_trn.data, yp_trn)
-            auc_val = roc_auc_score(II_val.data, yp_val)
-            self.logger.info('Epoch %d: AUC trn = %.3lf, AUC val = %.3lf (%.2lf seconds)' %
-                             (i, auc_trn, auc_val, time() - t0))
+            model.fit_partial(II, user_features=UF, item_features=SF, num_threads=NTH, verbose=False)
+            yp = sigmoid(model.predict(II.row, II.col, item_features=SF, user_features=UF, num_threads=NTH))
+            auc = roc_auc_score(II.data, yp)
+            self.logger.info('Epoch %d: AUC trn = %.3lf (%.2lf seconds)' % (i, auc, time() - t0))
+        with open(self.best_model_path, 'wb') as fp:
+            pickle.dump(model, fp)
+            self.logger.info('Saved model to %s' % self.best_model_path)
+
+    def predict(self):
+
+        UI, SI, UF, SF = self.get_features(test=True)
+
+        with open(self.best_model_path, 'rb') as fp:
+            model = pickle.load(fp)
+
+        yp, b = np.zeros(len(UI), dtype=np.float64), 100000
+        for i in range(0, len(UI), b):
+            yp[i:i + b] = model.predict(UI[i:i + b], SI[i:i + b], SF, UF, num_threads=NTH)
+
+        yp = sigmoid(yp)
+        self.logger.info('Target mean: %.3lf' % np.mean(yp))
+
+        df = pd.DataFrame({'id': list(range(len(yp))), 'target': yp})
+        df.to_csv(self.predict_path, index=False)
+        self.logger.info('Saved %s' % self.predict_path)
 
 
 if __name__ == "__main__":
@@ -206,6 +241,8 @@ if __name__ == "__main__":
     model = LFMRec(
         data_dir='data',
         artifacts_dir='artifacts/lfmrec',
+        best_model_path='artifacts/lfmrec/model_best.pkl',
+        predict_path='artifacts/lfmrec/predict_tst_%d.csv' % int(time())
     )
 
     if args['fit']:
