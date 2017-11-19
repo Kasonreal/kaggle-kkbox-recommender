@@ -193,7 +193,7 @@ class LFMRec(object):
         hpgrid = list(product(
             [10**x for x in range(-6, -4)] + [0],
             ['adagrad', 'adadelta'],
-            [10**x for x in range(-4, 0)],
+            [10**x for x in range(-4, 0)] + [5 * 10**x for x in range(-4, 0)],
             range(10, 160, 20),
         ))
 
@@ -233,7 +233,7 @@ class LFMRec(object):
                     yp_val = model.predict(II_val.row, II_val.col, SF, UF, num_threads=NTH)
                     auc_trn = roc_auc_score(II_trn.data, sigmoid(yp_trn))
                     auc_val = roc_auc_score(II_val.data, sigmoid(yp_val))
-                    improved = auc_val - auc_min_delta > auc_val_max
+                    improved = auc_val - auc_min_delta >= auc_val_max
                     lteqmax = 0 if improved else lteqmax + 1
                     auc_val_max = max(auc_val_max, auc_val)
                     self.logger.info('Epoch %d: trn = %.3lf val = %.3lf (%d sec)' %
