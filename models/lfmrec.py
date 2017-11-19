@@ -236,6 +236,9 @@ class LFMRec(object):
                 auc_val_mean += auc_val_max / nb_folds
                 epochs_mean += (epochs - ltmax) / nb_folds
 
+                if auc_val_max < 0.63:
+                    break
+
             self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
 
             if auc_val_mean >= auc_val_mean_max:
