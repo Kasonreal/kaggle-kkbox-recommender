@@ -202,7 +202,7 @@ class LFMRec(object):
         nb_folds = 5
         skfolds = StratifiedKFold(nb_folds)
         auc_val_mean_max = 0
-        best_hp = None
+        best_params = None
 
         for l2, nc, opt, lr in hpgrid:
             params = {'no_components': nc,
@@ -213,7 +213,7 @@ class LFMRec(object):
             self.logger.info('\n%s' % pformat(params))
             auc_val_mean = epochs_mean = 0
             for i, (ii_trn, ii_val) in enumerate(skfolds.split(II.data, II.data)):
-                self.logger.info('Split %d / %d' % (i, nb_folds))
+                self.logger.info('Fold %d / %d' % (i + 1, nb_folds))
                 model = LightFM(loss='logistic', **params)
                 II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
                 II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
@@ -235,15 +235,19 @@ class LFMRec(object):
 
             self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
 
-            if auc_val_mean > auc_val_mean_max:
+            if auc_val_mean >= auc_val_mean_max:
                 auc_val_mean_max = auc_val_mean
-                best_hp = params
+                best_params = params
                 params['epochs'] = round(epochs_mean, 3)
 
             self.logger.info('-' * 80)
             self.logger.info('Best AUC mean so far = %.3lf' % auc_val_mean_max)
-            self.logger.info('Best params so far:\n%s' % pformat(best_hp))
+            self.logger.info('Best params so far:\n%s' % pformat(best_params))
             self.logger.info('-' * 80)
+
+            fp = open('%s/search-params.txt' % self.artifacts_dir, 'w')
+            fp.write('%.3lf\n%s\n' % (auc_val_mean_max, pformat(best_params)))
+            fp.close()
 
     def fit(self):
 
