@@ -1,10 +1,13 @@
+from itertools import product
 from lightfm import LightFM
 from lightfm.cross_validation import random_train_test_split
 from multiprocessing import cpu_count
 from more_itertools import flatten
 from os.path import exists
+from pprint import pformat
 from scipy.sparse import coo_matrix, csr_matrix, save_npz, load_npz
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from time import time
 import argparse
 import json
@@ -16,7 +19,6 @@ import pdb
 import sys
 
 NTH = cpu_count()
-
 np.random.seed(865)
 
 
@@ -185,6 +187,58 @@ class LFMRec(object):
 
         return read_return()
 
+    def hpo(self):
+
+        II, UF, SF = self.get_features(train=True)
+
+        hpgrid = product(
+            range(10, 160, 20),
+            [10**x for x in range(-4, -1)],
+            [0] + [10**x for x in range(-6, -3)],
+            ['adadelta', 'adagrad']
+        )
+
+        nb_folds = 3
+        skfolds = StratifiedKFold(nb_folds)
+        auc_val_mean_max = 0
+        best_hp = None
+
+        for nc, lr, a, opt in hpgrid:
+
+            model = LightFM(loss='logistic', no_components=nc, learning_rate=lr,
+                            item_alpha=a, user_alpha=a, learning_schedule=opt)
+            self.logger.info(pformat(model.get_params()))
+            auc_val_mean = epochs_mean = 0
+            for ii_trn, ii_val in skfolds.split(II.data, II.data):
+                II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
+                II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
+                auc_val = auc_val_max = epochs = ltmax = 0
+                while ltmax < 3:
+                    t0 = time()
+                    model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=NTH)
+                    yp_trn = model.predict(II_trn.row, II_trn.col, SF, UF, num_threads=NTH)
+                    yp_val = model.predict(II_val.row, II_val.col, SF, UF, num_threads=NTH)
+                    auc_trn = roc_auc_score(II_trn.data, sigmoid(yp_trn))
+                    auc_val = roc_auc_score(II_val.data, sigmoid(yp_val))
+                    auc_val_max = max(auc_val_max, auc_val)
+                    ltmax = 0 if auc_val == auc_val_max else ltmax + 1
+                    self.logger.info('Epoch %d: trn = %.3lf val = %.3lf (%d sec)' %
+                                     (epochs, auc_trn, auc_val, time() - t0))
+                    epochs += 1
+                auc_val_mean += auc_val_max / nb_folds
+                epochs_mean += epochs / nb_folds
+
+            self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
+
+            if auc_val_mean > auc_val_mean_max:
+                auc_val_mean_max = auc_val_mean
+                best_hp = (nc, lr, a, opt, epochs_mean)
+
+            self.logger.info('*' * 80)
+            self.logger.info('Best AUC mean so far = %.3lf' % auc_val_mean_max)
+            self.logger.info('Best params so far: %s' % str(best_hp))
+            self.logger.info('*' * 80)
+
     def fit(self):
 
         II, UF, SF = self.get_features(train=True)
@@ -236,6 +290,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description='')
     ap.add_argument('--fit', action='store_true', default=False)
     ap.add_argument('--predict', action='store_true', default=False)
+    ap.add_argument('--hpo', action='store_true', default=False)
     args = vars(ap.parse_args())
 
     model = LFMRec(
@@ -248,5 +303,8 @@ if __name__ == "__main__":
     if args['fit']:
         model.fit()
 
-    elif args['predict']:
+    if args['predict']:
         model.predict()
+
+    if args['hpo']:
+        model.hpo()
