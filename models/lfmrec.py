@@ -202,8 +202,8 @@ class LFMRec(object):
 
         nb_folds = 5
         epochs_max = 100
-        patience = 5
-        auc_min_delta = 0.01
+        patience = 8
+        auc_min_delta = 0.005
         auc_mean_max = 0
         best_params = None
 
@@ -264,22 +264,12 @@ class LFMRec(object):
     def fit(self):
 
         II, UF, SF = self.get_features(train=True)
-        model = LightFM(no_components=100, loss='logistic', learning_rate=0.1, item_alpha=1e-4, user_alpha=1e-4)
+        model = LightFM(loss='logistic', no_components=110, learning_rate=0.1,
+                        item_alpha=1e-6, user_alpha=1e-6, learning_schedule='adagrad')
 
-        # II_trn, II_val = random_train_test_split(II, test_percentage=0.2, random_state=np.random)
-        # for i in range(100):
-        #     t0 = time()
-        #     model.fit_partial(II_trn, user_features=UF, item_features=SF, num_threads=cpu_count(), verbose=False)
-        #     yp_trn = model.predict(II_trn.row, II_trn.col, item_features=SF, user_features=UF, num_threads=cpu_count())
-        #     yp_val = model.predict(II_val.row, II_val.col, item_features=SF, user_features=UF, num_threads=cpu_count())
-        #     auc_trn = roc_auc_score(II_trn.data, sigmoid(yp_trn))
-        #     auc_val = roc_auc_score(II_val.data, sigmoid(yp_val))
-        #     self.logger.info('Epoch %d: AUC trn = %.3lf, AUC val = %.3lf (%.2lf seconds)' %
-        #                      (i, auc_trn, auc_val, time() - t0))
-
-        for i in range(4):
+        for i in range(1):
             t0 = time()
-            model.fit_partial(II, user_features=UF, item_features=SF, num_threads=NTH, verbose=False)
+            model.fit_partial(II, user_features=UF, item_features=SF, num_threads=NTH)
             yp = sigmoid(model.predict(II.row, II.col, item_features=SF, user_features=UF, num_threads=NTH))
             auc = roc_auc_score(II.data, yp)
             self.logger.info('Epoch %d: AUC trn = %.3lf (%.2lf seconds)' % (i, auc, time() - t0))
