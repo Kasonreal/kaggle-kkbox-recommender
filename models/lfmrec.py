@@ -192,11 +192,14 @@ class LFMRec(object):
         II, UF, SF = self.get_features(train=True)
 
         hpgrid = list(product(
-            [0] + [10**x for x in range(-6, -3)],
-            range(10, 160, 20),
+            [10**x for x in range(-6, -4)] + [0],
             ['adagrad', 'adadelta'],
-            [10**x for x in range(-4, -1)],
+            [10**x for x in range(-4, 0)],
+            range(10, 160, 20),
         ))
+
+        _rng = np.random.RandomState(int(time()))
+        _rng.shuffle(hpgrid)
 
         epochs_max = 100
         nb_folds = 5
@@ -204,7 +207,7 @@ class LFMRec(object):
         auc_val_mean_max = 0
         best_params = None
 
-        for l2, nc, opt, lr in hpgrid:
+        for l2, opt, lr, nc in hpgrid:
             params = {'no_components': nc,
                       'learning_rate': lr,
                       'item_alpha': l2,
