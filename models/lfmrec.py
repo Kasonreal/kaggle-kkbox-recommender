@@ -198,18 +198,22 @@ class LFMRec(object):
             ['adadelta', 'adagrad']
         )
 
-        nb_folds = 3
+        nb_folds = 5
         skfolds = StratifiedKFold(nb_folds)
         auc_val_mean_max = 0
         best_hp = None
 
         for nc, lr, a, opt in hpgrid:
-
-            model = LightFM(loss='logistic', no_components=nc, learning_rate=lr,
-                            item_alpha=a, user_alpha=a, learning_schedule=opt)
-            self.logger.info(pformat(model.get_params()))
+            params = {'no_components': nc,
+                      'learning_rate': lr,
+                      'item_alpha': a,
+                      'user_alpha': a,
+                      'learning_schedule': opt}
+            self.logger.info('\n%s' % pformat(params))
             auc_val_mean = epochs_mean = 0
-            for ii_trn, ii_val in skfolds.split(II.data, II.data):
+            for i, (ii_trn, ii_val) in enumerate(skfolds.split(II.data, II.data)):
+                self.logger.info('Split %d / %d' % (i, nb_folds))
+                model = LightFM(loss='logistic', **params)
                 II_trn = coo_matrix((II.data[ii_trn], (II.row[ii_trn], II.col[ii_trn])))
                 II_val = coo_matrix((II.data[ii_val], (II.row[ii_val], II.col[ii_val])))
                 auc_val = auc_val_max = epochs = ltmax = 0
@@ -227,18 +231,18 @@ class LFMRec(object):
                     epochs += 1
                 auc_val_mean += auc_val_max / nb_folds
                 epochs_mean += (epochs - ltmax) / nb_folds
-                self.logger.info('*' * 10)
 
             self.logger.info('AUC mean = %.3lf' % (auc_val_mean))
 
             if auc_val_mean > auc_val_mean_max:
                 auc_val_mean_max = auc_val_mean
-                best_hp = (nc, lr, a, opt, round(epochs_mean, 2))
+                best_hp = params
+                params['epochs'] = round(epochs_mean, 3)
 
-            self.logger.info('*' * 80)
+            self.logger.info('-' * 80)
             self.logger.info('Best AUC mean so far = %.3lf' % auc_val_mean_max)
-            self.logger.info('Best params so far: %s' % str(best_hp))
-            self.logger.info('*' * 80)
+            self.logger.info('Best params so far:\n%s' % pformat(best_hp))
+            self.logger.info('-' * 80)
 
     def fit(self):
 
