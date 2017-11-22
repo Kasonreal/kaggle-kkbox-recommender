@@ -194,7 +194,7 @@ class LFMRec(object):
             [10**x for x in range(-6, -4)] + [0],
             ['adagrad', 'adadelta'],
             [10**x for x in range(-4, 0)] + [5 * 10**x for x in range(-4, 0)],
-            range(10, 160, 20),
+            range(20, 80, 10),
         ))
 
         _rng = np.random.RandomState(int(time()))
@@ -264,10 +264,10 @@ class LFMRec(object):
     def fit(self):
 
         II, UF, SF = self.get_features(train=True)
-        model = LightFM(loss='logistic', no_components=110, learning_rate=0.1,
-                        item_alpha=1e-6, user_alpha=1e-6, learning_schedule='adagrad')
+        model = LightFM(loss='logistic', no_components=50, learning_rate=0.005,
+                        item_alpha=1e-6, user_alpha=1e-6, learning_schedule='adadelta')
 
-        for i in range(1):
+        for i in range(4):
             t0 = time()
             model.fit_partial(II, user_features=UF, item_features=SF, num_threads=NTH)
             yp = sigmoid(model.predict(II.row, II.col, item_features=SF, user_features=UF, num_threads=NTH))
