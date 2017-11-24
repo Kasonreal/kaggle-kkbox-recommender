@@ -15,11 +15,13 @@ import pickle
 import pdb
 import sys
 
-from torch.autograd import Variable
-import math
-import torch
-import torch.nn as nn
-import torch.optim as optim
+# from torch.autograd import Variable
+# import math
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+
+import keras
 
 NTRN = 7377418
 NTST = 2556790
@@ -32,169 +34,221 @@ assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
 
-class SparseAdam(torch.optim.Optimizer):
-    """Implements lazy version of Adam algorithm suitable for sparse tensors.
-    In this variant, only moments that show up in the gradient get updated, and
-    only those portions of the gradient get applied to the parameters.
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square (default: (0.9, 0.999))
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8)
-    .. _Adam\: A Method for Stochastic Optimization:
-        https://arxiv.org/abs/1412.6980
-    """
+# class SparseAdam(torch.optim.Optimizer):
+#     """Implements lazy version of Adam algorithm suitable for sparse tensors.
+#     In this variant, only moments that show up in the gradient get updated, and
+#     only those portions of the gradient get applied to the parameters.
+#     Arguments:
+#         params (iterable): iterable of parameters to optimize or dicts defining
+#             parameter groups
+#         lr (float, optional): learning rate (default: 1e-3)
+#         betas (Tuple[float, float], optional): coefficients used for computing
+#             running averages of gradient and its square (default: (0.9, 0.999))
+#         eps (float, optional): term added to the denominator to improve
+#             numerical stability (default: 1e-8)
+#     .. _Adam\: A Method for Stochastic Optimization:
+#         https://arxiv.org/abs/1412.6980
+#     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
-        defaults = dict(lr=lr, betas=betas, eps=eps)
-        super(SparseAdam, self).__init__(params, defaults)
+#     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+#         defaults = dict(lr=lr, betas=betas, eps=eps)
+#         super(SparseAdam, self).__init__(params, defaults)
 
-    def step(self, closure=None):
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
+#     def step(self, closure=None):
+#         """Performs a single optimization step.
+#         Arguments:
+#             closure (callable, optional): A closure that reevaluates the model
+#                 and returns the loss.
+#         """
+#         loss = None
+#         if closure is not None:
+#             loss = closure()
 
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if not grad.is_sparse:
-                    raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
+#         for group in self.param_groups:
+#             for p in group['params']:
+#                 if p.grad is None:
+#                     continue
+#                 grad = p.grad.data
+#                 if not grad.is_sparse:
+#                     raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
 
-                state = self.state[p]
+#                 state = self.state[p]
 
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    # state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg'] = p.data * 0
-                    # Exponential moving average of squared gradient values
-                    # state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = p.data * 0
+#                 # State initialization
+#                 if len(state) == 0:
+#                     state['step'] = 0
+#                     # Exponential moving average of gradient values
+#                     # state['exp_avg'] = torch.zeros_like(p.data)
+#                     state['exp_avg'] = p.data * 0
+#                     # Exponential moving average of squared gradient values
+#                     # state['exp_avg_sq'] = torch.zeros_like(p.data)
+#                     state['exp_avg_sq'] = p.data * 0
 
-                state['step'] += 1
+#                 state['step'] += 1
 
-                grad = grad.coalesce()  # the update is non-linear so indices must be unique
-                grad_indices = grad._indices()
-                grad_values = grad._values()
-                size = grad.size()
+#                 grad = grad.coalesce()  # the update is non-linear so indices must be unique
+#                 grad_indices = grad._indices()
+#                 grad_values = grad._values()
+#                 size = grad.size()
 
-                def make_sparse(values):
-                    constructor = grad.new
-                    if grad_indices.dim() == 0 or values.dim() == 0:
-                        return constructor().resize_as_(grad)
-                    return constructor(grad_indices, values, size)
+#                 def make_sparse(values):
+#                     constructor = grad.new
+#                     if grad_indices.dim() == 0 or values.dim() == 0:
+#                         return constructor().resize_as_(grad)
+#                     return constructor(grad_indices, values, size)
 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
+#                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+#                 beta1, beta2 = group['betas']
 
-                # Decay the first and second moment running average coefficient
-                #      old <- b * old + (1 - b) * new
-                # <==> old += (1 - b) * (new - old)
-                old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
-                exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
-                exp_avg.add_(make_sparse(exp_avg_update_values))
-                old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
-                exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
-                exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
+#                 # Decay the first and second moment running average coefficient
+#                 #      old <- b * old + (1 - b) * new
+#                 # <==> old += (1 - b) * (new - old)
+#                 old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
+#                 exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
+#                 exp_avg.add_(make_sparse(exp_avg_update_values))
+#                 old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
+#                 exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
+#                 exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
 
-                # Dense addition again is intended, avoiding another _sparse_mask
-                numer = exp_avg_update_values.add_(old_exp_avg_values)
-                denom = exp_avg_sq_update_values.add_(old_exp_avg_sq_values).sqrt_().add_(group['eps'])
-                del exp_avg_update_values, exp_avg_sq_update_values
+#                 # Dense addition again is intended, avoiding another _sparse_mask
+#                 numer = exp_avg_update_values.add_(old_exp_avg_values)
+#                 denom = exp_avg_sq_update_values.add_(old_exp_avg_sq_values).sqrt_().add_(group['eps'])
+#                 del exp_avg_update_values, exp_avg_sq_update_values
 
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+#                 bias_correction1 = 1 - beta1 ** state['step']
+#                 bias_correction2 = 1 - beta2 ** state['step']
+#                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
-                p.data.add_(make_sparse(-step_size * numer.div_(denom)))
+#                 p.data.add_(make_sparse(-step_size * numer.div_(denom)))
 
-        return loss
+#         return loss
 
 
-class GenericVectorSpace(nn.Module):
+# class GenericVectorSpace(nn.Module):
+
+#     def __init__(self,
+#                  feats_unique,
+#                  vec_size=50,
+#                  vec_init_func=np.random.normal,
+#                  vec_init_params=(0, 0.01),
+#                  optimizer=SparseAdam,
+#                  optimizer_params={'lr': 0.01}):
+#         super(GenericVectorSpace, self).__init__()
+
+#         # Lookup feature tuple -> index.
+#         # TODO: lookup for missing features.
+#         self.feat2idx = dict(zip(feats_unique, list(range(len(feats_unique)))))
+
+#         # Single embedding for all features.
+#         self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=True)
+
+#         # Initialize weights using given random distribution and parameters.
+#         vw = vec_init_func(*vec_init_params, (len(feats_unique), vec_size))
+#         self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
+
+#         # Training criteria.
+#         self.optimizer = optimizer(self.parameters(), **optimizer_params)
+#         self.criterion = nn.BCEWithLogitsLoss()
+
+#     @staticmethod
+#     def _sigmoid(z):
+#         return 1. / (1 + np.exp(-z))
+
+#     def fit_batch(self, X, yt):
+
+#         # Convert features in X to vector indexes.
+#         # 0.0005 seconds for 630 rows.
+#         X_idxs = [[self.feat2idx[x1], self.feat2idx[x2]] for x1, x2 in X]
+
+#         # Convert given variables.
+#         X_idxs_torch = Variable(torch.LongTensor(X_idxs)).cuda()
+#         yt_torch = Variable(torch.FloatTensor(yt)).cuda()
+
+#         # Forward pass.
+#         self.optimizer.zero_grad()
+#         yp_torch = self.forward(X_idxs_torch)
+#         loss = self.criterion(yp_torch, yt_torch)
+
+#         # Backward pass and update.
+#         loss.backward()
+#         self.optimizer.step()
+
+#         # Compute, return metrics.
+#         loss = loss.cpu().data.numpy()[0]
+#         yp = self._sigmoid(yp_torch.cpu().data.numpy())
+#         auc = roc_auc_score(yt, yp)
+#         return loss, auc
+
+#     # def fit_generator(self, batch_gen, batch_size, nb_samples, stop_func):
+#     #     nb_epochs = 0
+#     #     return
+
+#     def predict_batch(self, X):
+#         # TODO: apply sigmoid after forward() call.
+#         return
+
+#     def forward(self, X_idxs):
+
+#         # Retrieve the feature vectors by their indexes.
+#         X_vecs = self.vecs(X_idxs)
+
+#         # Element-wise product across the sample dimension. (b, 2, v) -> (b, v)
+#         prod = torch.prod(X_vecs, dim=1)
+
+#         # Sum across the sample dimension. (b, v) -> (b,)
+#         return torch.sum(prod, dim=1)
+
+
+class GenericVectorSpace():
 
     def __init__(self,
-                 feats_unique,
-                 vec_size=50,
-                 vec_init_func=np.random.normal,
-                 vec_init_params=(0, 0.01),
-                 optimizer=SparseAdam,
-                 optimizer_params={'lr': 0.01}):
-        super(GenericVectorSpace, self).__init__()
+                 nb_vecs,
+                 nb_vecs_per_sample=2,
+                 vec_size=60,
+                 vecs_name='VECS',
+                 vecs_init=keras.initializers.RandomNormal(0, 0.01),
+                 optimizer=keras.optimizers.Adam,
+                 optimizer_args={'lr': 0.01}):
+        self.nb_vecs = nb_vecs
+        self.nb_vecs_per_sample = nb_vecs_per_sample
+        self.vec_size = vec_size
+        self.vecs_name = vecs_name
+        self.vecs_init = vecs_init
+        self.optimizer = optimizer
+        self.optimizer_args = optimizer_args
+        self.net = self._make_net()
 
-        # Lookup feature tuple -> index.
-        # TODO: lookup for missing features.
-        self.feat2idx = dict(zip(feats_unique, list(range(len(feats_unique)))))
+    def _make_net(self):
 
-        # Single embedding for all features.
-        self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=True)
+        vecs = keras.layers.Embedding(
+            self.nb_vecs,
+            self.vec_size,
+            name=self.vecs_name,
+            embeddings_initializer=self.vecs_init)
 
-        # Initialize weights using given random distribution and parameters.
-        vw = vec_init_func(*vec_init_params, (len(feats_unique), vec_size))
-        self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
+        # Retrieve vectors.
+        inp_vidxs = keras.layers.Input((self.nb_vecs_per_sample,))
+        vecs_ = vecs(inp_vidxs)
 
-        # Training criteria.
-        self.optimizer = optimizer(self.parameters(), **optimizer_params)
-        self.criterion = nn.BCEWithLogitsLoss()
+        # Dot product computed along the sample axis.
+        K = keras.backend
+        prods = keras.layers.Lambda(lambda vecs_: K.prod(vecs_, axis=1))(vecs_)
+        sums = keras.layers.Lambda(lambda vecs_: K.sum(vecs_, axis=1))(prods)
 
-    @staticmethod
-    def _sigmoid(z):
-        return 1. / (1 + np.exp(-z))
+        # Sigmoid for classification.
+        sigm = keras.layers.Activation('sigmoid')(sums)
 
-    def fit_batch(self, X, yt):
+        return keras.models.Model(inp_vidxs, sigm)
 
-        # Convert features in X to vector indexes.
-        # 0.0005 seconds for 630 rows.
-        X_idxs = [[self.feat2idx[x1], self.feat2idx[x2]] for x1, x2 in X]
+    def compile(self):
+        self.net.compile(optimizer=self.optimizer(**self.optimizer_args))
 
-        # Convert given variables.
-        X_idxs_torch = Variable(torch.LongTensor(X_idxs)).cuda()
-        yt_torch = Variable(torch.FloatTensor(yt)).cuda()
+    def fit_generator(self, batch_gen):
+        pdb.set_trace()
+        # return self.net.fit_generator(**kwargs)
 
-        # Forward pass.
-        self.optimizer.zero_grad()
-        yp_torch = self.forward(X_idxs_torch)
-        loss = self.criterion(yp_torch, yt_torch)
-
-        # Backward pass and update.
-        loss.backward()
-        self.optimizer.step()
-
-        # Compute, return metrics.
-        loss = loss.cpu().data.numpy()[0]
-        yp = self._sigmoid(yp_torch.cpu().data.numpy())
-        auc = roc_auc_score(yt, yp)
-        return loss, auc
-
-    # def fit_generator(self, batch_gen, batch_size, nb_samples, stop_func):
-    #     nb_epochs = 0
-    #     return
-
-    def predict_batch(self, X):
-        # TODO: apply sigmoid after forward() call.
-        return
-
-    def forward(self, X_idxs):
-
-        # Retrieve the feature vectors by their indexes.
-        X_vecs = self.vecs(X_idxs)
-
-        # Element-wise product across the sample dimension. (b, 2, v) -> (b, v)
-        prod = torch.prod(X_vecs, dim=1)
-
-        # Sum across the sample dimension. (b, v) -> (b,)
-        return torch.sum(prod, dim=1)
+    def load_model(self, **kwargs):
+        self.net = keras.models.load_model(**kwargs)
 
 
 def round_to(n, r):
@@ -405,10 +459,17 @@ class MultiVecRec(object):
 
         return keys, feats
 
-    def fit(self):
+    def fit_vector_space(self, batch_size=10000):
 
         # Get keys and features.
         samples, feats = self.get_features(train=True)
+
+        # Compute all of the unique feature keys.
+        feats_unique = set(flatten(feats.values()))
+        self.logger.info('Identified %d unique features' % len(feats_unique))
+
+        # Mapping from feature to vector index.
+        feat2vidx = dict(zip(feats_unique, list(range(len(feats_unique)))))
 
         # Generator to yield products of user features and song features.
         # In the current configuration there are ~7M * 7 * 9 interactions.
@@ -420,26 +481,26 @@ class MultiVecRec(object):
             user_keys = samples['user'].values
             song_keys = samples['song'].values
             targets = samples['target'].values
+
             while True:
                 ii = np.random.permutation(len(samples))
                 for ii_ in np.array_split(ii, ceil(len(samples) / batch_size)):
                     X, y = [], []
                     for i in ii_:
                         for p in product(feats[user_keys[i]], feats[song_keys[i]]):
-                            X.append(p)
+                            X.append([feat2vidx[f] for f in p])
                             y.append(float(targets[i]))
                     yield X, y
 
-        # Compute all of the unique feature keys.
-        feats_unique = set(flatten(feats.values()))
-        self.logger.info('Identified %d unique features' % len(feats_unique))
+        # Instantiate the vector training model and fit the vector space.
+        model = GenericVectorSpace(nb_vecs=len(feats_unique),
+                                   nb_vecs_per_sample=2,
+                                   vec_size=50)
+        model.compile()
+        batch_gen = product_gen()
 
-        # Instantiate the vector training model.
-        model = GenericVectorSpace(feats_unique, vec_size=50)
-        model.cuda()
+        pdb.set_trace()
 
-        # Fit the vector space.
-        batch_gen = product_gen(10000)
         # stop_func = lambda epoch, loss, auc: epoch > 10 or auc > 0.85
         # model.fit_generator(batch_gen, 10000, len(samples), stop_func)
 
