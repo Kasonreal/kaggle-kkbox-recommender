@@ -116,13 +116,20 @@ class SGNS(nn.Module):
         self.vecs.weight.data.normal_(0, 0.01)
 
     def forward(self, vii):
-        vecs = self.vecs(vii)
-        prod = torch.prod(vecs, dim=1)
-        return torch.sum(prod, dim=1)
+        outputs = Variable(torch.zeros(len(vii)))
+        for i in range(len(vii)):
+            vecs = self.vecs(vii[i])
+            outputs[i] = torch.sum(torch.prod(vecs, dim=0))
+        return outputs
+
+    # def forward(self, vii):
+    #     vecs = self.vecs(vii)
+    #     prod = torch.prod(vecs, dim=1)
+    #     return torch.sum(prod, dim=1)
 
 if __name__ == "__main__":
 
-    TRN = pd.read_csv('data/train.csv', usecols=['msno', 'song_id', 'target'])
+    TRN = pd.read_csv('data/train.csv', usecols=['msno', 'song_id', 'target'], nrows=10000)
 
     X = np.zeros((len(TRN), 2), dtype=int)
     X[:, 0] = LabelEncoder().fit_transform(TRN['msno'])
@@ -135,13 +142,13 @@ if __name__ == "__main__":
     Xt, Xv, ytt, ytv = train_test_split(X, y, test_size=0.3, shuffle=True)
 
     net = SGNS(nb_vecs=X.max() + 1, nb_dims=100)
-    net.cuda()
-    optimizer = SparseAdam(net.parameters(), lr=0.001)
+    # net.cuda()
+    optimizer = SparseAdam(net.parameters(), lr=0.01)
     # optimizer = optim.SGD(net.parameters(), lr=0.1)
     criterion = nn.BCEWithLogitsLoss()
 
     batch_size = 40000
-    nb_epochs = 200
+    nb_epochs = 10
 
     for epoch in range(nb_epochs):
         ii = np.random.permutation(len(Xt))
@@ -151,8 +158,8 @@ if __name__ == "__main__":
             Xt_ = Xt[ii_]
             ytt_ = ytt[ii_]
 
-            Xt_torch_ = Variable(torch.LongTensor(Xt_)).cuda()
-            ytt_torch_ = Variable(torch.FloatTensor(ytt_)).cuda()
+            Xt_torch_ = Variable(torch.LongTensor(Xt_))  # .cuda()
+            ytt_torch_ = Variable(torch.FloatTensor(ytt_))  # .cuda()
 
             optimizer.zero_grad()
             ypp_torch_ = net(Xt_torch_)

@@ -17,8 +17,10 @@ import torch.optim as optim
 
 NTRN = 7377418
 NTST = 2556790
-MISSING = 0
 np.random.seed(865)
+
+# Reserved index for missing values.
+MISSING = 0
 
 
 def round_to(n, r):
@@ -65,71 +67,64 @@ def encode(series, is_missing=lambda x: False, split_multi=lambda x: [x], missin
     return labeled
 
 
-def feats_cols_to_rows(feats_cols):
-    """Convert list of lists from format feature->sample to sample->feature."""
-    t0 = time()
-    feats_rows = []
-    for r in range(len(feats_cols[0])):
-        feats_rows.append([])
-        for c in range(len(feats_cols)):
-            feats_rows[r].append(feats_cols[c][r])
-    print(time() - t0)
-    return feats_rows
-
-
 def df_to_user_feats(df):
+    """ Returning:
+    ids: sequential ids for each unique user.
+    feats: mapping user id -> [(feature type, feature value), ...]
+    names: names of the feature types.
+    """
 
-    names, feats = [], []
+    # Remove duplicate users.
+    df = df.drop_duplicates('msno')
 
-    # User id.
-    t0 = time()
-    feats.append(encode(df['msno']))
-    names.append('user-id')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+    # Ids are used to lookup the users in the feature map.
+    ids = list(range(len(df)))
 
-    # User ages get rounded to multiples of 5.
-    # Values outside a reasonable range are considered missing.
-    t0 = time()
-    df['bd'] = round_to(df['bd'], 5)
+    # Each user's id maps to a list of features.
+    feats = {id_: [] for id_ in ids}
+    names = []  # Names of the features.
+
+    # User index.
+    for i, f in zip(ids, encode(df['msno'])):
+        feats[i].append((len(names), *f))
+    names.append('user-index')
+
+    # User ages. Round to multiples of 5.
+    # Values clipped outside a reasonable range.
     is_missing = lambda x: x <= 5 or x > 70
-    feats.append(encode(df['bd'], is_missing))
+    for i, f in zip(ids, encode(round_to(df['bd'], 5), is_missing)):
+        feats[i].append((len(names), *f))
     names.append('user-age')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # User city. No missing values.
-    t0 = time()
-    feats.append(encode(df['city']))
+    for i, f in zip(ids, encode(df['city'])):
+        feats[i].append((len(names), *f))
     names.append('user-city')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # User gender. Missing if not 'female' or 'male'.
-    t0 = time()
     is_missing = lambda x: x not in {'female', 'male'}
-    feats.append(encode(df['gender'], is_missing))
+    for i, f in zip(ids, encode(df['gender'], is_missing)):
+        feats[i].append((len(names), *f))
     names.append('user-gender')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # User registration method. No missing values.
-    t0 = time()
-    feats.append(encode(df['registered_via']))
+    for i, f in zip(ids, encode(df['registered_via'])):
+        feats[i].append((len(names), *f))
     names.append('user-registration-method')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # User account age, in years. No missing values.
-    t0 = time()
-    y0 = df['registration_init_time'].apply(lambda x: int(str(x)[:4])).values
-    y1 = df['expiration_date'].apply(lambda x: int(str(x)[:4])).values
-    feats.append(encode(y1 - y0))
+    y0 = df['registration_init_time'].apply(lambda x: int(str(x)[: 4])).values
+    y1 = df['expiration_date'].apply(lambda x: int(str(x)[: 4])).values
+    for i, f in zip(ids, encode(y1 - y0)):
+        feats[i].append((len(names), *f))
     names.append('user-account-age')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # User registration year. No missing values.
-    t0 = time()
-    feats.append(encode(y0))
+    for i, f in zip(ids, encode(y0)):
+        feats[i].append((len(names), *f))
     names.append('user-registration-year')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
-    return names, feats_cols_to_rows(feats)
+    return ids, feats, names
 
 
 def df_to_item_feats(df):
@@ -158,7 +153,7 @@ def df_to_item_feats(df):
 
     # Item year. Missing if nan. Split into 3-year intervals.
     t0 = time()
-    x = df['isrc'].apply(lambda x: int(x[5:7]) if type(x) == str else x)
+    x = df['isrc'].apply(lambda x: int(x[5: 7]) if type(x) == str else x)
     x = round_to(x, 3)
     feats.append(encode(x, is_missing=np.isnan))
     names.append('item-year')
@@ -166,7 +161,7 @@ def df_to_item_feats(df):
 
     # Item country.
     t0 = time()
-    x = df['isrc'].apply(lambda x: x[:2] if type(x) == str else x)
+    x = df['isrc'].apply(lambda x: x[: 2] if type(x) == str else x)
     feats.append(encode(x, is_missing=lambda x: type(x) is not str))
     names.append('item-country')
     print('%-30s %.3lf sec.' % (names[-1], time() - t0))
@@ -194,31 +189,42 @@ def df_to_item_feats(df):
 
 
 def df_to_ctxt_feats(df):
+    """ Returning:
+    ids: sequential ids for each context.
+    feats: mapping context id -> [(feature type, feature value), ...]
+    names: names of the feature types.
+    """
 
-    names, feats = [], []
+    # Context is defined as a combination of three columns.
+    # Remove the duplicate contexts.
+    df = df.drop_duplicates(['source_screen_name', 'source_system_tab', 'source_type'])
+
+    # Ids are used to lookup the users in the feature map.
+    ids = list(range(len(df)))
+
+    # Each context's id maps to a list of features.
+    feats = {id_: [] for id_ in ids}
+    names = []
 
     # Context screen name. Missing if "Unknown" or nan.
-    t0 = time()
     is_missing = lambda x: x == 'Unknown' or type(x) is not str
-    feats.append(encode(df['source_screen_name'], is_missing))
+    for i, f in zip(ids, encode(df['source_screen_name'], is_missing)):
+        feats[i].append((len(names), *f))
     names.append('ctxt-screen-name')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # Context system tab. Missing if "null" or nan.
-    t0 = time()
     is_missing = lambda x: x == 'null' or type(x) is not str
-    feats.append(encode(df['source_system_tab'], is_missing))
+    for i, f in zip(ids, encode(df['source_system_tab'], is_missing)):
+        feats[i].append((len(names), *f))
     names.append('ctxt-system-tab')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
     # Context source type. Missing if nan.
-    t0 = time()
     is_missing = lambda x: type(x) is not str
-    feats.append(encode(df['source_type'], is_missing))
+    for i, f in zip(ids, encode(df['source_type'], is_missing)):
+        feats[i].append((len(names), *f))
     names.append('ctxt-source-type')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
 
-    return names, feats_cols_to_rows(feats)
+    return ids, feats, names
 
 
 class Net(nn.Module):
@@ -248,23 +254,24 @@ class MultiVecRec(object):
 
     def get_features(self, train=False, test=False):
 
-        path_user_feats = '%s/feats-user.pkl' % self.artifacts_dir
-        path_item_feats = '%s/feats-item.pkl' % self.artifacts_dir
-        path_ctxt_feats = '%s/feats-ctxt.pkl' % self.artifacts_dir
+        path_ids_trn = '%s/data-ids-trn.pkl' % self.artifacts_dir
+        path_ids_tst = '%s/data-ids-tst.pkl' % self.artifacts_dir
+        path_feats_user = '%s/data-feats-user.pkl' % self.artifacts_dir
+        path_feats_item = '%s/data-feats-item.pkl' % self.artifacts_dir
+        path_feats_ctxt = '%s/data-feats-ctxt.pkl' % self.artifacts_dir
 
-        feats_on_disk = exists(path_user_feats)
-        feats_on_disk = feats_on_disk and exists(path_item_feats)
-        feats_on_disk = feats_on_disk and exists(path_ctxt_feats)
+        feats_on_disk = exists(path_feats_user)
+        feats_on_disk = feats_on_disk and exists(path_feats_item)
+        feats_on_disk = feats_on_disk and exists(path_feats_ctxt)
 
         if not feats_on_disk:
 
-            t0 = time()
             self.logger.info('Reading dataframes')
             SNG = pd.read_csv('%s/songs.csv' % self.data_dir)
             SEI = pd.read_csv('%s/song_extra_info.csv' % self.data_dir, usecols=['song_id', 'isrc'])
             MMB = pd.read_csv('%s/members.csv' % self.data_dir)
-            TRN = pd.read_csv('%s/train.csv' % self.data_dir)
-            TST = pd.read_csv('%s/test.csv' % self.data_dir)
+            TRN = pd.read_csv('%s/train.csv' % self.data_dir, nrows=100000)
+            TST = pd.read_csv('%s/test.csv' % self.data_dir, nrows=100000)
 
             self.logger.info('Merge SNG and SEI.')
             SNG = SNG.merge(SEI, on='song_id', how='left')
@@ -284,35 +291,41 @@ class MultiVecRec(object):
             CMB.drop('id', inplace=True, axis=1)
             CMB.drop('target', inplace=True, axis=1)
 
-            self.logger.info('Encoding user features')
-            names, feats = df_to_user_feats(CMB)
-            with open(path_user_feats, 'wb') as fp:
+            t0 = time()
+            self.logger.info('Encoding user features (%d sec)' % (time() - t0))
+            ids, feats, names = df_to_user_feats(CMB)
+            with open(path_feats_user, 'wb') as fp:
                 pickle.dump((names, feats), fp)
+            self.logger.info('%d seconds' % (time() - t0))
 
-            self.logger.info('Encoding item features')
-            names, feats = df_to_item_feats(CMB)
-            with open(path_item_feats, 'wb') as fp:
-                pickle.dump((names, feats), fp)
+            # self.logger.info('Encoding item features')
+            # names, feats = df_to_item_feats(CMB)
+            # with open(path_feats_item, 'wb') as fp:
+            #     pickle.dump((names, feats), fp)
 
+            t0 = time()
             self.logger.info('Encoding context features')
-            names, feats = df_to_ctxt_feats(CMB)
-            with open(path_ctxt_feats, 'wb') as fp:
-                pickle.dump((names, feats), fp)
+            ids, feats, names = df_to_ctxt_feats(CMB)
+            with open(path_feats_ctxt, 'wb') as fp:
+                pickle.dump((feats, names), fp)
+            self.logger.info('%d seconds' % (time() - t0))
 
         def load_pickle(path):
             with open(path, 'rb') as fp:
                 return pickle.load(fp)
 
         if train:
-            usn, usf = load_pickle(path_user_feats)
-            itn, itf = load_pickle(path_item_feats)
-            ctn, ctf = load_pickle(path_ctxt_feats)
+            usn, usf = load_pickle(path_feats_user)
+            pdb.set_trace()
+
+            itn, itf = load_pickle(path_feats_item)
+            ctn, ctf = load_pickle(path_feats_ctxt)
             return usn, usf[:NTRN], itn, itf[:NTRN], ctn, ctf[:NTRN]
 
         if test:
-            usn, usf = load_pickle(path_user_feats)
-            itn, itf = load_pickle(path_item_feats)
-            ctn, ctf = load_pickle(path_ctxt_feats)
+            usn, usf = load_pickle(path_feats_user)
+            itn, itf = load_pickle(path_feats_item)
+            ctn, ctf = load_pickle(path_feats_ctxt)
             return usn, usf[-NTST:], itn, itf[-NTST:], ctn, ctf[-NTST:]
 
     def fit(self):
