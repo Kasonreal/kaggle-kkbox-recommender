@@ -1,3 +1,6 @@
+from collections import Counter
+from math import log
+from more_itertools import flatten
 from os.path import exists
 from sklearn.metrics import roc_auc_score
 from time import time
@@ -20,211 +23,131 @@ NTST = 2556790
 np.random.seed(865)
 
 # Reserved index for missing values.
-MISSING = 0
+MISSING = 'MISSING'
 
 
 def round_to(n, r):
     return round(n / r) * r
 
 
-def encode(series, is_missing=lambda x: False, split_multi=lambda x: [x], missing_label=MISSING):
-    # vals = ['a', 'b', 'c']
-    # print(vals, encode(vals))
-    # vals = ['a|b', 'b', 'c', 'c|d']
-    # print(vals, encode(vals, split_multi=lambda x: x.split('|')))
-    # vals = ['a', 'b', 'a|b', 'no']
-    # print(vals, encode(vals, split_multi=lambda x: x.split('|'), is_missing=lambda x: x == 'no'))
+def get_user_feats(df):
+    """For each user, create a mapping from a unique user key to
+    a list of [feature type, feature value] pairs."""
 
-    raw_to_label = dict()
-    next_label = missing_label + 1
-    labeled = []
+    # Key is the user id prefixed by "u-".
+    msno2key = lambda x: 'u-%s' % x
+    keys = df['msno'].apply(msno2key).values.tolist()
 
-    for raw in series:
-
-        # Prepare empty list for this value.
-        labeled.append([])
-
-        # If the value meets "missing" criteria, just set the missing label.
-        if is_missing(raw):
-            labeled[-1].append(missing_label)
-            continue
-
-        # Split the raw value into potentially several values.
-        for raw_ in split_multi(raw):
-
-            # Otherwise try to get its label.
-            label = raw_to_label.get(raw_)
-
-            # If it's not defined, define it.
-            if label is None:
-                label = next_label
-                raw_to_label[raw_] = next_label
-                next_label += 1
-
-            # Set the label.
-            labeled[-1].append(label)
-
-    return labeled
-
-
-def df_to_user_feats(df):
-    """ Returning:
-    ids: sequential ids for each unique user.
-    feats: mapping user id -> [(feature type, feature value), ...]
-    names: names of the feature types.
-    """
-
-    # Remove duplicate users.
+    # Remove duplicate based on Id.
     df = df.drop_duplicates('msno')
+    keys_dedup = df['msno'].apply(msno2key).values.tolist()
 
-    # Ids are used to lookup the users in the feature map.
-    ids = list(range(len(df)))
+    # Build mapping from unique keys to features.
+    keys2feats = {k: [] for k in keys_dedup}
 
-    # Each user's id maps to a list of features.
-    feats = {id_: [] for id_ in ids}
-    names = []  # Names of the features.
+    for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
-    # User index.
-    for i, f in zip(ids, encode(df['msno'])):
-        feats[i].append((len(names), *f))
-    names.append('user-index')
+        # User msno (id).
+        keys2feats[k].append(['u-msno', row['msno']])
 
-    # User ages. Round to multiples of 5.
-    # Values clipped outside a reasonable range.
-    is_missing = lambda x: x <= 5 or x > 70
-    for i, f in zip(ids, encode(round_to(df['bd'], 5), is_missing)):
-        feats[i].append((len(names), *f))
-    names.append('user-age')
+        # User age. Clipped and rounded.
+        if not (0 < row['bd'] < 70):
+            keys2feats[k].append(['u-age', MISSING])
+        else:
+            keys2feats[k].append(['u-age', round_to(row['bd'], 5)])
 
-    # User city. No missing values.
-    for i, f in zip(ids, encode(df['city'])):
-        feats[i].append((len(names), *f))
-    names.append('user-city')
+        # User city. No missing values.
+        keys2feats[k].append(['u-city', int(row['city'])])
 
-    # User gender. Missing if not 'female' or 'male'.
-    is_missing = lambda x: x not in {'female', 'male'}
-    for i, f in zip(ids, encode(df['gender'], is_missing)):
-        feats[i].append((len(names), *f))
-    names.append('user-gender')
+        # User gender. Missing if not female or male.
+        if row['gender'] not in {'male', 'female'}:
+            keys2feats[k].append(['u-sex', MISSING])
+        else:
+            keys2feats[k].append(['u-sex', row['gender']])
 
-    # User registration method. No missing values.
-    for i, f in zip(ids, encode(df['registered_via'])):
-        feats[i].append((len(names), *f))
-    names.append('user-registration-method')
+        # User registration method. No missing values.
+        keys2feats[k].append(['u-reg-via', int(row['registered_via'])])
 
-    # User account age, in years. No missing values.
-    y0 = df['registration_init_time'].apply(lambda x: int(str(x)[: 4])).values
-    y1 = df['expiration_date'].apply(lambda x: int(str(x)[: 4])).values
-    for i, f in zip(ids, encode(y1 - y0)):
-        feats[i].append((len(names), *f))
-    names.append('user-account-age')
+        # User registration year. No missing values.
+        y0 = int(str(row['registration_init_time'])[:4])
+        keys2feats[k].append(['u-reg-year', y0])
 
-    # User registration year. No missing values.
-    for i, f in zip(ids, encode(y0)):
-        feats[i].append((len(names), *f))
-    names.append('user-registration-year')
+        # User account age, in years. No missing values.
+        y1 = int(str(row['expiration_date'])[:4])
+        keys2feats[k].append(['u-act-age', y1 - y0])
 
-    return ids, feats, names
+    return keys, keys2feats
 
 
-def df_to_item_feats(df):
+def get_song_feats(df):
 
-    names, feats = [], []
+    # Key is the song id prefixed by "s-"
+    songid2key = lambda x: 's-%s' % x
+    keys = df['song_id'].apply(songid2key).values.tolist()
 
-    # Item id.
-    t0 = time()
-    feats.append(encode(df['song_id']))
-    names.append('item-id')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+    # Remove duplicates.
+    df = df.drop_duplicates('song_id')
+    keys_dedup = df['song_id'].apply(songid2key).values.tolist()
 
-    # Item length. Missing if nan. Convert to minutes, log scale, round.
-    t0 = time()
-    x = df['song_length'] / 1000 / 60
-    x = np.log(np.clip(x, 0, x.max()) + 1).round()
-    feats.append(encode(x, is_missing=np.isnan))
-    names.append('item-length')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+    # Build mapping from unique keys to features.
+    keys2feats = {k: [] for k in keys_dedup}
 
-    # Item language. Missing if nan.
-    t0 = time()
-    feats.append(encode(df['language'], is_missing=np.isnan))
-    names.append('item-language')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+    for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
-    # Item year. Missing if nan. Split into 3-year intervals.
-    t0 = time()
-    x = df['isrc'].apply(lambda x: int(x[5: 7]) if type(x) == str else x)
-    x = round_to(x, 3)
-    feats.append(encode(x, is_missing=np.isnan))
-    names.append('item-year')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+        # Song id.
+        keys2feats[k].append(['s-id', row['song_id']])
 
-    # Item country.
-    t0 = time()
-    x = df['isrc'].apply(lambda x: x[: 2] if type(x) == str else x)
-    feats.append(encode(x, is_missing=lambda x: type(x) is not str))
-    names.append('item-country')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+        # Song length. Missing if nan.
+        if np.isnan(row['song_length']):
+            keys2feats[k].append(['s-len', MISSING])
+        else:
+            f = row['song_length'] / 1000 / 60
+            f = round(log(max(1, f)))
+            keys2feats[k].append(['s-len', f])
 
-    # Item genre. Missing if nan. Split on pipes.
-    t0 = time()
-    is_missing = lambda x: type(x) is not str
-    split_multi = lambda x: [s.strip() for s in x.split('|')]
-    feats.append(encode(df['genre_ids'], is_missing, split_multi))
-    names.append('item-genres')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+        # Song language. Missing if nan.
+        if np.isnan(row['language']):
+            keys2feats[k].append(['s-lang', MISSING])
+        else:
+            keys2feats[k].append(['s-lang', int(row['language'])])
 
-    # Item musicians. Combine artist, composer, lyricist into a single feature.
-    # Missing if nan. Split on pipes.
-    x = df.apply(lambda row: '|'.join([
-        row['artist_name'] if type(row['artist_name']) == str else '',
-        row['lyricist'] if type(row['lyricist']) == str else '',
-        row['composer'] if type(row['composer']) == str else '',
-    ]), axis=1)
-    feats.append(encode(x, is_missing, split_multi))
-    names.append('item-musician')
-    print('%-30s %.3lf sec.' % (names[-1], time() - t0))
+        # Song year. Missing if nan. Rounded to 3-year intervals.
+        # Song country. Missing if nan.
+        if type(row['isrc']) is not str:
+            keys2feats[k].append(['s-year', MISSING])
+            keys2feats[k].append(['s-country', MISSING])
+        else:
+            f = int(round_to(int(row['isrc'][5:7]), 3))
+            keys2feats[k].append(['s-year', f])
+            keys2feats[k].append(['s-country', row['isrc'][:2]])
 
-    return names, feats_cols_to_rows(feats)
+        # Song genre(s). Missing if nan. Split on pipes.
+        if type(row['genre_ids']) is not str:
+            keys2feats[k].append(['s-genre', MISSING])
+        else:
+            for g in row['genre_ids'].split('|'):
+                keys2feats[k].append(['s-genre', int(g)])
 
+        # Song musicians. Combine artist, composer, lyricist.
+        if str not in {type(row['artist_name']), type(row['composer']), type('lyricist')}:
+            keys2feats[k].append('s-musician', MISSING)
 
-def df_to_ctxt_feats(df):
-    """ Returning:
-    ids: sequential ids for each context.
-    feats: mapping context id -> [(feature type, feature value), ...]
-    names: names of the feature types.
-    """
+        # Artist. Missing if nan, but already accounted for.
+        if type(row['artist_name']) == str:
+            for m in row['artist_name'].split('|'):
+                keys2feats[k].append(['s-musician', m.strip()])
 
-    # Context is defined as a combination of three columns.
-    # Remove the duplicate contexts.
-    df = df.drop_duplicates(['source_screen_name', 'source_system_tab', 'source_type'])
+        # Composer. Missing if nan, but already accounted for.
+        if type(row['composer']) == str:
+            for m in row['composer'].split('|'):
+                keys2feats[k].append(['s-musician', m.strip()])
 
-    # Ids are used to lookup the users in the feature map.
-    ids = list(range(len(df)))
+        # Lyricist. Missing if nan, but already accounted for.
+        if type(row['lyricist']) == str:
+            for m in row['lyricist'].split('|'):
+                keys2feats[k].append(['s-musician', m.strip()])
 
-    # Each context's id maps to a list of features.
-    feats = {id_: [] for id_ in ids}
-    names = []
-
-    # Context screen name. Missing if "Unknown" or nan.
-    is_missing = lambda x: x == 'Unknown' or type(x) is not str
-    for i, f in zip(ids, encode(df['source_screen_name'], is_missing)):
-        feats[i].append((len(names), *f))
-    names.append('ctxt-screen-name')
-
-    # Context system tab. Missing if "null" or nan.
-    is_missing = lambda x: x == 'null' or type(x) is not str
-    for i, f in zip(ids, encode(df['source_system_tab'], is_missing)):
-        feats[i].append((len(names), *f))
-    names.append('ctxt-system-tab')
-
-    # Context source type. Missing if nan.
-    is_missing = lambda x: type(x) is not str
-    for i, f in zip(ids, encode(df['source_type'], is_missing)):
-        feats[i].append((len(names), *f))
-    names.append('ctxt-source-type')
-
-    return ids, feats, names
+    return keys, keys2feats
 
 
 class Net(nn.Module):
@@ -254,24 +177,21 @@ class MultiVecRec(object):
 
     def get_features(self, train=False, test=False):
 
-        path_ids_trn = '%s/data-ids-trn.pkl' % self.artifacts_dir
-        path_ids_tst = '%s/data-ids-tst.pkl' % self.artifacts_dir
-        path_feats_user = '%s/data-feats-user.pkl' % self.artifacts_dir
-        path_feats_item = '%s/data-feats-item.pkl' % self.artifacts_dir
-        path_feats_ctxt = '%s/data-feats-ctxt.pkl' % self.artifacts_dir
+        path_sample_keys_trn = '%s/data-sample-keys-trn.csv' % self.artifacts_dir
+        path_sample_keys_tst = '%s/data-sample-keys-tst.csv' % self.artifacts_dir
+        path_feats = '%s/data-feats.json' % self.artifacts_dir
 
-        feats_on_disk = exists(path_feats_user)
-        feats_on_disk = feats_on_disk and exists(path_feats_item)
-        feats_on_disk = feats_on_disk and exists(path_feats_ctxt)
+        pp = [path_sample_keys_trn, path_sample_keys_tst, path_feats]
+        feats_ready = sum([exists(p) for p in pp]) == len(pp)
 
-        if not feats_on_disk:
+        if not feats_ready:
 
             self.logger.info('Reading dataframes')
             SNG = pd.read_csv('%s/songs.csv' % self.data_dir)
             SEI = pd.read_csv('%s/song_extra_info.csv' % self.data_dir, usecols=['song_id', 'isrc'])
             MMB = pd.read_csv('%s/members.csv' % self.data_dir)
-            TRN = pd.read_csv('%s/train.csv' % self.data_dir, nrows=100000)
-            TST = pd.read_csv('%s/test.csv' % self.data_dir, nrows=100000)
+            TRN = pd.read_csv('%s/train.csv' % self.data_dir)
+            TST = pd.read_csv('%s/test.csv' % self.data_dir)
 
             self.logger.info('Merge SNG and SEI.')
             SNG = SNG.merge(SEI, on='song_id', how='left')
@@ -286,54 +206,56 @@ class MultiVecRec(object):
             CMB = TRN.append(TST)
 
             # Throw away unused after merging.
-            del SEI, MMB, TRN, TST
+            del SEI, MMB
 
-            CMB.drop('id', inplace=True, axis=1)
-            CMB.drop('target', inplace=True, axis=1)
+            self.logger.info('Encoding user features')
+            ukeys, ukeys2feats = get_user_feats(CMB)
 
-            t0 = time()
-            self.logger.info('Encoding user features (%d sec)' % (time() - t0))
-            ids, feats, names = df_to_user_feats(CMB)
-            with open(path_feats_user, 'wb') as fp:
-                pickle.dump((names, feats), fp)
-            self.logger.info('%d seconds' % (time() - t0))
+            self.logger.info('Encoding song features')
+            skeys, skeys2feats = get_song_feats(CMB)
 
-            # self.logger.info('Encoding item features')
-            # names, feats = df_to_item_feats(CMB)
-            # with open(path_feats_item, 'wb') as fp:
-            #     pickle.dump((names, feats), fp)
+            self.logger.info('Saving features')
+            with open(path_feats, 'w') as fp:
+                feats = ukeys2feats.copy()
+                feats.update(skeys2feats)
+                json.dump(feats, fp, ensure_ascii=False, sort_keys=True, indent=2)
 
-            t0 = time()
-            self.logger.info('Encoding context features')
-            ids, feats, names = df_to_ctxt_feats(CMB)
-            with open(path_feats_ctxt, 'wb') as fp:
-                pickle.dump((feats, names), fp)
-            self.logger.info('%d seconds' % (time() - t0))
+            self.logger.info('Saving training keys')
+            keys_trn = pd.DataFrame({
+                'user': ukeys[:min(NTRN, len(TRN))],
+                'song': skeys[:min(NTRN, len(TRN))],
+                'target': TRN['target']
+            })
+            keys_trn.to_csv(path_sample_keys_trn, index=False)
 
-        def load_pickle(path):
-            with open(path, 'rb') as fp:
-                return pickle.load(fp)
+            self.logger.info('Saving testing keys')
+            keys_tst = pd.DataFrame({
+                'id': TST['id'],
+                'user': ukeys[-min(NTST, len(TST)):],
+                'song': skeys[-min(NTST, len(TST)):]
+            })
+            keys_tst.to_csv(path_sample_keys_tst, index=False)
 
-        if train:
-            usn, usf = load_pickle(path_feats_user)
-            pdb.set_trace()
+        # Read from disk and return keys and features.
+        keys = pd.read_csv(path_sample_keys_trn) if train else pd.read_csv(path_sample_keys_tst)
+        with open(path_feats) as fp:
+            feats = json.load(fp)
 
-            itn, itf = load_pickle(path_feats_item)
-            ctn, ctf = load_pickle(path_feats_ctxt)
-            return usn, usf[:NTRN], itn, itf[:NTRN], ctn, ctf[:NTRN]
-
-        if test:
-            usn, usf = load_pickle(path_feats_user)
-            itn, itf = load_pickle(path_feats_item)
-            ctn, ctf = load_pickle(path_feats_ctxt)
-            return usn, usf[-NTST:], itn, itf[-NTST:], ctn, ctf[-NTST:]
+        return keys, feats
 
     def fit(self):
 
-        feats = self.get_features()
-        user_names, user_feats, item_names, item_feats, ctxt_names, ctxt_feats = feats
+        # Get keys and features.
 
-        pdb.set_trace()
+        # Pre-train user and song vectors to minimize:
+        # error(sigmoid(dot(user feature vector, song feature vector)), target)
+
+        # Train weighted model on pre-trained feature vectors. Either:
+        # 1. interaction-constrained factorization machine.
+        # 2. vector aggregator.
+
+    pass
+
 
 if __name__ == "__main__":
 
