@@ -1,3 +1,4 @@
+from collections import Counter
 from itertools import product
 from math import log, ceil
 from more_itertools import flatten
@@ -15,13 +16,11 @@ import pickle
 import pdb
 import sys
 
-# from torch.autograd import Variable
-# import math
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-
-import keras
+from torch.autograd import Variable
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 NTRN = 7377418
 NTST = 2556790
@@ -34,221 +33,241 @@ assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
 
-# class SparseAdam(torch.optim.Optimizer):
-#     """Implements lazy version of Adam algorithm suitable for sparse tensors.
-#     In this variant, only moments that show up in the gradient get updated, and
-#     only those portions of the gradient get applied to the parameters.
-#     Arguments:
-#         params (iterable): iterable of parameters to optimize or dicts defining
-#             parameter groups
-#         lr (float, optional): learning rate (default: 1e-3)
-#         betas (Tuple[float, float], optional): coefficients used for computing
-#             running averages of gradient and its square (default: (0.9, 0.999))
-#         eps (float, optional): term added to the denominator to improve
-#             numerical stability (default: 1e-8)
-#     .. _Adam\: A Method for Stochastic Optimization:
-#         https://arxiv.org/abs/1412.6980
-#     """
+class SparseAdam(torch.optim.Optimizer):
+    """Implements lazy version of Adam algorithm suitable for sparse tensors.
+    In this variant, only moments that show up in the gradient get updated, and
+    only those portions of the gradient get applied to the parameters.
+    Arguments:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float, optional): learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square (default: (0.9, 0.999))
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+    .. _Adam\: A Method for Stochastic Optimization:
+        https://arxiv.org/abs/1412.6980
+    """
 
-#     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
-#         defaults = dict(lr=lr, betas=betas, eps=eps)
-#         super(SparseAdam, self).__init__(params, defaults)
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super(SparseAdam, self).__init__(params, defaults)
 
-#     def step(self, closure=None):
-#         """Performs a single optimization step.
-#         Arguments:
-#             closure (callable, optional): A closure that reevaluates the model
-#                 and returns the loss.
-#         """
-#         loss = None
-#         if closure is not None:
-#             loss = closure()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
 
-#         for group in self.param_groups:
-#             for p in group['params']:
-#                 if p.grad is None:
-#                     continue
-#                 grad = p.grad.data
-#                 if not grad.is_sparse:
-#                     raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if not grad.is_sparse:
+                    raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
 
-#                 state = self.state[p]
+                state = self.state[p]
 
-#                 # State initialization
-#                 if len(state) == 0:
-#                     state['step'] = 0
-#                     # Exponential moving average of gradient values
-#                     # state['exp_avg'] = torch.zeros_like(p.data)
-#                     state['exp_avg'] = p.data * 0
-#                     # Exponential moving average of squared gradient values
-#                     # state['exp_avg_sq'] = torch.zeros_like(p.data)
-#                     state['exp_avg_sq'] = p.data * 0
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    # state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg'] = p.data * 0
+                    # Exponential moving average of squared gradient values
+                    # state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = p.data * 0
 
-#                 state['step'] += 1
+                state['step'] += 1
 
-#                 grad = grad.coalesce()  # the update is non-linear so indices must be unique
-#                 grad_indices = grad._indices()
-#                 grad_values = grad._values()
-#                 size = grad.size()
+                grad = grad.coalesce()  # the update is non-linear so indices must be unique
+                grad_indices = grad._indices()
+                grad_values = grad._values()
+                size = grad.size()
 
-#                 def make_sparse(values):
-#                     constructor = grad.new
-#                     if grad_indices.dim() == 0 or values.dim() == 0:
-#                         return constructor().resize_as_(grad)
-#                     return constructor(grad_indices, values, size)
+                def make_sparse(values):
+                    constructor = grad.new
+                    if grad_indices.dim() == 0 or values.dim() == 0:
+                        return constructor().resize_as_(grad)
+                    return constructor(grad_indices, values, size)
 
-#                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-#                 beta1, beta2 = group['betas']
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
 
-#                 # Decay the first and second moment running average coefficient
-#                 #      old <- b * old + (1 - b) * new
-#                 # <==> old += (1 - b) * (new - old)
-#                 old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
-#                 exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
-#                 exp_avg.add_(make_sparse(exp_avg_update_values))
-#                 old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
-#                 exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
-#                 exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
+                # Decay the first and second moment running average coefficient
+                #      old <- b * old + (1 - b) * new
+                # <==> old += (1 - b) * (new - old)
+                old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
+                exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
+                exp_avg.add_(make_sparse(exp_avg_update_values))
+                old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
+                exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
+                exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
 
-#                 # Dense addition again is intended, avoiding another _sparse_mask
-#                 numer = exp_avg_update_values.add_(old_exp_avg_values)
-#                 denom = exp_avg_sq_update_values.add_(old_exp_avg_sq_values).sqrt_().add_(group['eps'])
-#                 del exp_avg_update_values, exp_avg_sq_update_values
+                # Dense addition again is intended, avoiding another _sparse_mask
+                numer = exp_avg_update_values.add_(old_exp_avg_values)
+                denom = exp_avg_sq_update_values.add_(old_exp_avg_sq_values).sqrt_().add_(group['eps'])
+                del exp_avg_update_values, exp_avg_sq_update_values
 
-#                 bias_correction1 = 1 - beta1 ** state['step']
-#                 bias_correction2 = 1 - beta2 ** state['step']
-#                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
-#                 p.data.add_(make_sparse(-step_size * numer.div_(denom)))
+                p.data.add_(make_sparse(-step_size * numer.div_(denom)))
 
-#         return loss
+        return loss
 
-
-# class GenericVectorSpace(nn.Module):
-
-#     def __init__(self,
-#                  feats_unique,
-#                  vec_size=50,
-#                  vec_init_func=np.random.normal,
-#                  vec_init_params=(0, 0.01),
-#                  optimizer=SparseAdam,
-#                  optimizer_params={'lr': 0.01}):
-#         super(GenericVectorSpace, self).__init__()
-
-#         # Lookup feature tuple -> index.
-#         # TODO: lookup for missing features.
-#         self.feat2idx = dict(zip(feats_unique, list(range(len(feats_unique)))))
-
-#         # Single embedding for all features.
-#         self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=True)
-
-#         # Initialize weights using given random distribution and parameters.
-#         vw = vec_init_func(*vec_init_params, (len(feats_unique), vec_size))
-#         self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
-
-#         # Training criteria.
-#         self.optimizer = optimizer(self.parameters(), **optimizer_params)
-#         self.criterion = nn.BCEWithLogitsLoss()
-
-#     @staticmethod
-#     def _sigmoid(z):
-#         return 1. / (1 + np.exp(-z))
-
-#     def fit_batch(self, X, yt):
-
-#         # Convert features in X to vector indexes.
-#         # 0.0005 seconds for 630 rows.
-#         X_idxs = [[self.feat2idx[x1], self.feat2idx[x2]] for x1, x2 in X]
-
-#         # Convert given variables.
-#         X_idxs_torch = Variable(torch.LongTensor(X_idxs)).cuda()
-#         yt_torch = Variable(torch.FloatTensor(yt)).cuda()
-
-#         # Forward pass.
-#         self.optimizer.zero_grad()
-#         yp_torch = self.forward(X_idxs_torch)
-#         loss = self.criterion(yp_torch, yt_torch)
-
-#         # Backward pass and update.
-#         loss.backward()
-#         self.optimizer.step()
-
-#         # Compute, return metrics.
-#         loss = loss.cpu().data.numpy()[0]
-#         yp = self._sigmoid(yp_torch.cpu().data.numpy())
-#         auc = roc_auc_score(yt, yp)
-#         return loss, auc
-
-#     # def fit_generator(self, batch_gen, batch_size, nb_samples, stop_func):
-#     #     nb_epochs = 0
-#     #     return
-
-#     def predict_batch(self, X):
-#         # TODO: apply sigmoid after forward() call.
-#         return
-
-#     def forward(self, X_idxs):
-
-#         # Retrieve the feature vectors by their indexes.
-#         X_vecs = self.vecs(X_idxs)
-
-#         # Element-wise product across the sample dimension. (b, 2, v) -> (b, v)
-#         prod = torch.prod(X_vecs, dim=1)
-
-#         # Sum across the sample dimension. (b, v) -> (b,)
-#         return torch.sum(prod, dim=1)
+ICFM_HYPERPARAMS_DEFAULT = {
+    'optimizer': SparseAdam,
+    'optimizer_kwargs': {'lr': 0.01},
+    'vec_size': 50,
+    'vec_init_func': np.random.normal,
+    'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
+}
 
 
-class GenericVectorSpace():
+class ICFM(nn.Module):
 
-    def __init__(self,
-                 nb_vecs,
-                 nb_vecs_per_sample=2,
-                 vec_size=60,
-                 vecs_name='VECS',
-                 vecs_init=keras.initializers.RandomNormal(0, 0.01),
-                 optimizer=keras.optimizers.Adam,
-                 optimizer_args={'lr': 0.01}):
-        self.nb_vecs = nb_vecs
-        self.nb_vecs_per_sample = nb_vecs_per_sample
-        self.vec_size = vec_size
-        self.vecs_name = vecs_name
-        self.vecs_init = vecs_init
-        self.optimizer = optimizer
-        self.optimizer_args = optimizer_args
-        self.net = self._make_net()
+    def __init__(self, grouped_feat_names, feats_unique,
+                 optimizer, optimizer_kwargs, vec_size,
+                 vec_init_func, vec_init_kwargs, ):
+        super(ICFM, self).__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-    def _make_net(self):
+        # Compute the possible feature interactions.
+        # Feature interactions are denoted as tuples of feature names.
+        self.inters = grouped_feat_names[0]
+        for feat_names in grouped_feat_names[1:]:
+            self.inters = list(product(self.inters, feat_names))
+        self.inters = sorted(self.inters)
+        self.logger.info('%d feature interactions' % len(self.inters))
 
-        vecs = keras.layers.Embedding(
-            self.nb_vecs,
-            self.vec_size,
-            name=self.vecs_name,
-            embeddings_initializer=self.vecs_init)
+        # Lookup feature interaction -> weight index.
+        self.inter2idx = {f: i for i, f in enumerate(self.inters)}
 
-        # Retrieve vectors.
-        inp_vidxs = keras.layers.Input((self.nb_vecs_per_sample,))
-        vecs_ = vecs(inp_vidxs)
+        # Lookup feature -> vector index.
+        self.feat2idx = {f: i for i, f in enumerate(feats_unique)}
 
-        # Dot product computed along the sample axis.
-        K = keras.backend
-        prods = keras.layers.Lambda(lambda vecs_: K.prod(vecs_, axis=1))(vecs_)
-        sums = keras.layers.Lambda(lambda vecs_: K.sum(vecs_, axis=1))(prods)
+        # Common vector space for all features.
+        self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=True)
 
-        # Sigmoid for classification.
-        sigm = keras.layers.Activation('sigmoid')(sums)
+        # Initialize vector space  w/ given distribution and parameters.
+        vec_init_kwargs.update({'size': (len(feats_unique), vec_size)})
+        vw = vec_init_func(**vec_init_kwargs)
+        self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
 
-        return keras.models.Model(inp_vidxs, sigm)
+        # Initialize weights for each interaction.
+        # TODO: make this initialization configurable.
+        self.W_inter = Variable(torch.randn(len(self.inters)), requires_grad=True)
 
-    def compile(self):
-        self.net.compile(optimizer=self.optimizer(**self.optimizer_args))
+        # Initialize bias for all interactions.
+        self.b_inter = Variable(torch.ones(1), requires_grad=True)
 
-    def fit_generator(self, batch_gen):
+        # Training criteria.
+        self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
+        self.criterion = nn.BCEWithLogitsLoss()
+
+    def forward(self, sample_batch):
+
+        # feats_batch approximate shape (batch, no. groups, no. feats / group)
+        # Example batch with one sample.
+        # [[
+        #     [
+        #         ('u-msno', 'FGtll...'),
+        #         ('u-age', 'MISSING'),
+        #         ('u-city', 1),
+        #         ('u-sex', 'MISSING'),
+        #         ('u-reg-via', 7),
+        #         ('u-reg-year', 2012),
+        #         ('u-act-age', 5)],
+        #     [
+        #         ('s-id', 'BBzum...'),
+        #         ('s-len', 1),
+        #         ('s-lang', 52),
+        #         ('s-year', 15),
+        #         ('s-country', 'GB'),
+        #         ('s-genre', 359),
+        #         ('s-musician', 'Bastille'),
+        #         ('s-musician', 'Dan Smith'),
+        #         ('s-musician', 'Mark Crew')
+        #     ]
+        # ], ...]
+
+        # 0  ('u-act-age', 's-country')
+        # 1  ('u-act-age', 's-genre')
+        # 2  ('u-act-age', 's-id')
+        # 3  ('u-act-age', 's-lang')
+        # 4  ('u-act-age', 's-len')
+        # 5  ('u-act-age', 's-musician')
+        # 6  ('u-act-age', 's-year')
+        # 7  ('u-age', 's-country')
+        # 8  ('u-age', 's-genre')
+        # 9  ('u-age', 's-id')
+        # 10 ('u-age', 's-lang')
+        # 11 ('u-age', 's-len')
+        # 12 ('u-age', 's-musician')
+        # 13 ('u-age', 's-year')
+        # 14 ('u-city', 's-country')
+        # 15 ('u-city', 's-genre')
+        # 16 ('u-city', 's-id')
+        # 17 ('u-city', 's-lang')
+        # 18 ('u-city', 's-len')
+        # 19 ('u-city', 's-musician')
+        # 20 ('u-city', 's-year')
+        # 21 ('u-msno', 's-country')
+        # 22 ('u-msno', 's-genre')
+        # 23 ('u-msno', 's-id')
+        # 24 ('u-msno', 's-lang')
+        # 25 ('u-msno', 's-len')
+        # 26 ('u-msno', 's-musician')
+        # 27 ('u-msno', 's-year')
+        # 28 ('u-reg-via', 's-country')
+        # 29 ('u-reg-via', 's-genre')
+        # 30 ('u-reg-via', 's-id')
+        # 31 ('u-reg-via', 's-lang')
+        # 32 ('u-reg-via', 's-len')
+        # 33 ('u-reg-via', 's-musician')
+        # 34 ('u-reg-via', 's-year')
+        # 35 ('u-reg-year', 's-country')
+        # 36 ('u-reg-year', 's-genre')
+        # 37 ('u-reg-year', 's-id')
+        # 38 ('u-reg-year', 's-lang')
+        # 39 ('u-reg-year', 's-len')
+        # 40 ('u-reg-year', 's-musician')
+        # 41 ('u-reg-year', 's-year')
+        # 42 ('u-sex', 's-country')
+        # 43 ('u-sex', 's-genre')
+        # 44 ('u-sex', 's-id')
+        # 45 ('u-sex', 's-lang')
+        # 46 ('u-sex', 's-len')
+        # 47 ('u-sex', 's-musician')
+        # 48 ('u-sex', 's-year')
+
+        # # Determine the number of interactions.
+        # nb_inters_max = max([len(g0) * len(g1) for g0, g1 in sample_batch])
+        # sample_matrix = np.zeros((len(sample_batch), 4, nb_inters_max), dtype=np.int32)
+
+        # for i, (g0, g1) in tqdm(enumerate(sample_batch)):
+
+        #     inter_cntr = Counter()
+        #     prod = product(g0, g1)
+
+        #     for j, (f0, f1) in enumerate(prod):
+        #         sample_matrix[i][0][j] = self.inter2idx[(f0[0], f1[0])]
+        #         sample_matrix[i][1][j] = self.feat2idx[f0]
+        #         sample_matrix[i][2][j] = self.feat2idx[f1]
+        #         inter_cntr[sample_matrix[i][0][j]] += 1
+
+        #     sample_matrix[i][3][:j] = [inter_cntr[ix] for ix in sample_matrix[i][0][:j]]
+
         pdb.set_trace()
-        # return self.net.fit_generator(**kwargs)
 
-    def load_model(self, **kwargs):
-        self.net = keras.models.load_model(**kwargs)
+        pass
 
 
 def round_to(n, r):
@@ -459,64 +478,37 @@ class MultiVecRec(object):
 
         return keys, feats
 
-    def fit_vector_space(self, batch_size=10000):
-
-        # Get keys and features.
-        samples, feats = self.get_features(train=True)
+    def fit(self, samples, feats, ii_trn=None, ii_val=None, ICFM_kwargs=ICFM_HYPERPARAMS_DEFAULT):
 
         # Compute all of the unique feature keys.
         feats_unique = set(flatten(feats.values()))
         self.logger.info('Identified %d unique features' % len(feats_unique))
 
-        # Mapping from feature to vector index.
-        feat2vidx = dict(zip(feats_unique, list(range(len(feats_unique)))))
+        # Names of user features.
+        feat_names_user, feat_names_song = set(), set()
+        for feat_name, feat in feats_unique:
+            if feat_name.startswith('u-'):
+                feat_names_user.add(feat_name)
+            elif feat_name.startswith('s-'):
+                feat_names_song.add(feat_name)
 
-        # Generator to yield products of user features and song features.
-        # In the current configuration there are ~7M * 7 * 9 interactions.
-        # [user feature, song feature, target]
-        # [['u-msno', 'hMLKXXl'], ['s-id', 'x+wwBW'], 0]
-        # [['u-msno', 'hMLKXXl'], ['s-len', 2], 0]
-        # [['u-msno', 'hMLKXXl'], ['s-lang', 3], 0]
-        def product_gen(batch_size):
-            user_keys = samples['user'].values
-            song_keys = samples['song'].values
-            targets = samples['target'].values
+        self.logger.info('User feature names: %s' % str(feat_names_user))
+        self.logger.info('Song feature names: %s' % str(feat_names_song))
 
-            while True:
-                ii = np.random.permutation(len(samples))
-                for ii_ in np.array_split(ii, ceil(len(samples) / batch_size)):
-                    X, y = [], []
-                    for i in ii_:
-                        for p in product(feats[user_keys[i]], feats[song_keys[i]]):
-                            X.append([feat2vidx[f] for f in p])
-                            y.append(float(targets[i]))
-                    yield X, y
+        icfm = ICFM(
+            grouped_feat_names=[feat_names_user, feat_names_song],
+            feats_unique=feats_unique,
+            **ICFM_kwargs
+        )
 
-        # Instantiate the vector training model and fit the vector space.
-        model = GenericVectorSpace(nb_vecs=len(feats_unique),
-                                   nb_vecs_per_sample=2,
-                                   vec_size=50)
-        model.compile()
-        batch_gen = product_gen()
+        user_keys = samples['user'].values
+        song_keys = samples['song'].values
+        targets = samples['target'].values
+
+        X = [[feats[user_keys[i]], feats[song_keys[i]]] for i in range(10000)]
+        icfm.forward(X)
 
         pdb.set_trace()
-
-        # stop_func = lambda epoch, loss, auc: epoch > 10 or auc > 0.85
-        # model.fit_generator(batch_gen, 10000, len(samples), stop_func)
-
-        for i in range(10000):
-            t0 = time()
-            loss, auc = model.fit_batch(*next(batch_gen))
-            print(i, round(loss, 5), round(auc, 5), round(time() - t0, 8))
-
-        pdb.set_trace()
-
-        # Pre-train user and song vectors to minimize:
-        # error(sigmoid(dot(user feature vector, song feature vector)), target)
-
-        # Train weighted model on pre-trained feature vectors. Either:
-        # 1. interaction-constrained factorization machine.
-        # 2. vector aggregator.
 
     pass
 
@@ -538,7 +530,7 @@ if __name__ == "__main__":
     )
 
     if args['fit']:
-        model.fit()
+        model.fit(*model.get_features(train=True))
 
     if args['predict']:
         model.predict()
