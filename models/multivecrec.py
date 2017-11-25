@@ -141,14 +141,13 @@ class ICFM(nn.Module):
 
         # Compute the possible feature interactions.
         # Feature interactions are denoted as tuples of feature names.
-        self.inters = grouped_feat_names[0]
+        self.intrs = grouped_feat_names[0]
         for feat_names in grouped_feat_names[1:]:
-            self.inters = list(product(self.inters, feat_names))
-        self.inters = sorted(self.inters)
-        self.logger.info('%d feature interactions' % len(self.inters))
+            self.intrs = list(product(self.intrs, feat_names))
+        self.logger.info('%d feature interactions' % len(self.intrs))
 
         # Lookup feature interaction -> weight index.
-        self.inter2idx = {f: i for i, f in enumerate(self.inters)}
+        self.intr2idx = {f: i for i, f in enumerate(self.intrs)}
 
         # Lookup feature -> vector index.
         self.feat2idx = {f: i for i, f in enumerate(feats_unique)}
@@ -163,111 +162,75 @@ class ICFM(nn.Module):
 
         # Initialize weights for each interaction.
         # TODO: make this initialization configurable.
-        self.W_inter = Variable(torch.randn(len(self.inters)), requires_grad=True)
+        self.intr_W = nn.Embedding(len(self.intrs), 1, sparse=True)
+        self.intr_W.weight.data.normal_(0, 1.0)
 
         # Initialize bias for all interactions.
-        self.b_inter = Variable(torch.ones(1), requires_grad=True)
+        # TODO: make this initialization configurable.
+        self.intr_b = nn.Parameter(torch.zeros(1))
 
         # Training criteria.
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
         self.criterion = nn.BCEWithLogitsLoss()
 
-    def forward(self, sample_batch):
+    def fit_batch(self, keys_batch, yt_batch, feats):
 
-        # feats_batch approximate shape (batch, no. groups, no. feats / group)
-        # Example batch with one sample.
-        # [[
-        #     [
-        #         ('u-msno', 'FGtll...'),
-        #         ('u-age', 'MISSING'),
-        #         ('u-city', 1),
-        #         ('u-sex', 'MISSING'),
-        #         ('u-reg-via', 7),
-        #         ('u-reg-year', 2012),
-        #         ('u-act-age', 5)],
-        #     [
-        #         ('s-id', 'BBzum...'),
-        #         ('s-len', 1),
-        #         ('s-lang', 52),
-        #         ('s-year', 15),
-        #         ('s-country', 'GB'),
-        #         ('s-genre', 359),
-        #         ('s-musician', 'Bastille'),
-        #         ('s-musician', 'Dan Smith'),
-        #         ('s-musician', 'Mark Crew')
-        #     ]
-        # ], ...]
+        # Convert the keys batch into a format that can be efficiently batched.
+        intr_idxs = []  # Index for ever interaction in the batch.
+        intr_divs = []  # Divisor for each interaction weight for duplicate interactions.
+        feat_idxs = []  # Feature indexes for pairs of features in the batch.
+        smpl_idxs = []  # Indexes into above lists for every sample.
 
-        # 0  ('u-act-age', 's-country')
-        # 1  ('u-act-age', 's-genre')
-        # 2  ('u-act-age', 's-id')
-        # 3  ('u-act-age', 's-lang')
-        # 4  ('u-act-age', 's-len')
-        # 5  ('u-act-age', 's-musician')
-        # 6  ('u-act-age', 's-year')
-        # 7  ('u-age', 's-country')
-        # 8  ('u-age', 's-genre')
-        # 9  ('u-age', 's-id')
-        # 10 ('u-age', 's-lang')
-        # 11 ('u-age', 's-len')
-        # 12 ('u-age', 's-musician')
-        # 13 ('u-age', 's-year')
-        # 14 ('u-city', 's-country')
-        # 15 ('u-city', 's-genre')
-        # 16 ('u-city', 's-id')
-        # 17 ('u-city', 's-lang')
-        # 18 ('u-city', 's-len')
-        # 19 ('u-city', 's-musician')
-        # 20 ('u-city', 's-year')
-        # 21 ('u-msno', 's-country')
-        # 22 ('u-msno', 's-genre')
-        # 23 ('u-msno', 's-id')
-        # 24 ('u-msno', 's-lang')
-        # 25 ('u-msno', 's-len')
-        # 26 ('u-msno', 's-musician')
-        # 27 ('u-msno', 's-year')
-        # 28 ('u-reg-via', 's-country')
-        # 29 ('u-reg-via', 's-genre')
-        # 30 ('u-reg-via', 's-id')
-        # 31 ('u-reg-via', 's-lang')
-        # 32 ('u-reg-via', 's-len')
-        # 33 ('u-reg-via', 's-musician')
-        # 34 ('u-reg-via', 's-year')
-        # 35 ('u-reg-year', 's-country')
-        # 36 ('u-reg-year', 's-genre')
-        # 37 ('u-reg-year', 's-id')
-        # 38 ('u-reg-year', 's-lang')
-        # 39 ('u-reg-year', 's-len')
-        # 40 ('u-reg-year', 's-musician')
-        # 41 ('u-reg-year', 's-year')
-        # 42 ('u-sex', 's-country')
-        # 43 ('u-sex', 's-genre')
-        # 44 ('u-sex', 's-id')
-        # 45 ('u-sex', 's-lang')
-        # 46 ('u-sex', 's-len')
-        # 47 ('u-sex', 's-musician')
-        # 48 ('u-sex', 's-year')
+        for k0, k1 in tqdm(keys_batch):
+            smpl_idxs.append([])
+            intr_cntr = Counter()
+            for f0, f1 in product(feats[k0], feats[k1]):
+                smpl_idxs[-1].append(len(intr_idxs))
+                intr_idxs.append(self.intr2idx[(f0[0], f1[0])])
+                feat_idxs.append([self.feat2idx[f0], self.feat2idx[f1]])
+                intr_cntr[intr_idxs[-1]] += 1
+            tail = len(feats[k0] * len(feats[k1]))
+            intr_divs += [intr_cntr[i] for i in intr_idxs[-tail:]]
 
-        # # Determine the number of interactions.
-        # nb_inters_max = max([len(g0) * len(g1) for g0, g1 in sample_batch])
-        # sample_matrix = np.zeros((len(sample_batch), 4, nb_inters_max), dtype=np.int32)
+        self.logger.info('Batch with %d samples and %d interactions' % (len(keys_batch), len(intr_idxs)))
 
-        # for i, (g0, g1) in tqdm(enumerate(sample_batch)):
+        # Convert indexes to torch-friendly types.
+        intr_idxs_ch = Variable(torch.LongTensor(intr_idxs)).cuda()
+        intr_divs_ch = Variable(torch.FloatTensor(intr_divs)).cuda()
+        feat_idxs_ch = Variable(torch.LongTensor(feat_idxs)).cuda()
+        smpl_idxs_ch = [Variable(torch.LongTensor(x)).cuda() for x in smpl_idxs]
 
-        #     inter_cntr = Counter()
-        #     prod = product(g0, g1)
+        # Forward pass.
+        yp_ch = self.forward(intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch)
 
-        #     for j, (f0, f1) in enumerate(prod):
-        #         sample_matrix[i][0][j] = self.inter2idx[(f0[0], f1[0])]
-        #         sample_matrix[i][1][j] = self.feat2idx[f0]
-        #         sample_matrix[i][2][j] = self.feat2idx[f1]
-        #         inter_cntr[sample_matrix[i][0][j]] += 1
+        # Loss, backprop, update.
 
-        #     sample_matrix[i][3][:j] = [inter_cntr[ix] for ix in sample_matrix[i][0][:j]]
+        # Update vectors for missing values.
 
         pdb.set_trace()
 
-        pass
+    def forward(self, intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch):
+
+        # Use the feat_idxs to retrieve vectors.
+        V_ = self.vecs(feat_idxs_ch)
+
+        # Dot products across sample axis.
+        D_ = torch.sum(torch.prod(V_, dim=1), dim=1)
+
+        # Use the intr_idxs to retrieve interaction weights.
+        W_ = self.intr_W(intr_idxs_ch)
+
+        # Divide each interaction weight by the interaction frequency for that sample.
+        # Multiply each of the dot products by its adjusted interaction weight.
+        # Add bias.
+        WDb_ = W_[:, 0] / intr_divs_ch * D_ + self.intr_b
+
+        # Sum each sample's indexes to get a scalar for each sample.
+        outputs = Variable(torch.zeros(len(smpl_idxs_ch)))
+        for i, idxs_ch in enumerate(smpl_idxs_ch):
+            outputs[i] = torch.sum(WDb_[idxs_ch])
+
+        return outputs
 
 
 def round_to(n, r):
@@ -500,13 +463,19 @@ class MultiVecRec(object):
             feats_unique=feats_unique,
             **ICFM_kwargs
         )
+        icfm.cuda()
 
         user_keys = samples['user'].values
         song_keys = samples['song'].values
         targets = samples['target'].values
 
-        X = [[feats[user_keys[i]], feats[song_keys[i]]] for i in range(10000)]
-        icfm.forward(X)
+        keys_batch, yt_batch = [], []
+        for i in range(1000):
+            keys_batch.append([user_keys[i], song_keys[i]])
+            yt_batch.append(targets[i])
+
+        # keys_batch = [[user_keys[i], song_keys[i]] for i in range(50000)]
+        icfm.fit_batch(keys_batch, yt_batch, feats)
 
         pdb.set_trace()
 
