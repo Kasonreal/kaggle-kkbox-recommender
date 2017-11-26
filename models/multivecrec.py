@@ -33,97 +33,8 @@ assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
 
-class SparseAdam(torch.optim.Optimizer):
-    """Implements lazy version of Adam algorithm suitable for sparse tensors.
-    In this variant, only moments that show up in the gradient get updated, and
-    only those portions of the gradient get applied to the parameters.
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square (default: (0.9, 0.999))
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8)
-    .. _Adam\: A Method for Stochastic Optimization:
-        https://arxiv.org/abs/1412.6980
-    """
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
-        defaults = dict(lr=lr, betas=betas, eps=eps)
-        super(SparseAdam, self).__init__(params, defaults)
-
-    def step(self, closure=None):
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if not grad.is_sparse:
-                    raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    # state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg'] = p.data * 0
-                    # Exponential moving average of squared gradient values
-                    # state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = p.data * 0
-
-                state['step'] += 1
-
-                grad = grad.coalesce()  # the update is non-linear so indices must be unique
-                grad_indices = grad._indices()
-                grad_values = grad._values()
-                size = grad.size()
-
-                def make_sparse(values):
-                    constructor = grad.new
-                    if grad_indices.dim() == 0 or values.dim() == 0:
-                        return constructor().resize_as_(grad)
-                    return constructor(grad_indices, values, size)
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
-
-                # Decay the first and second moment running average coefficient
-                #      old <- b * old + (1 - b) * new
-                # <==> old += (1 - b) * (new - old)
-                old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
-                exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
-                exp_avg.add_(make_sparse(exp_avg_update_values))
-                old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
-                exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
-                exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
-
-                # Dense addition again is intended, avoiding another _sparse_mask
-                numer = exp_avg_update_values.add_(old_exp_avg_values)
-                denom = exp_avg_sq_update_values.add_(old_exp_avg_sq_values).sqrt_().add_(group['eps'])
-                del exp_avg_update_values, exp_avg_sq_update_values
-
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
-
-                p.data.add_(make_sparse(-step_size * numer.div_(denom)))
-
-        return loss
-
 ICFM_HYPERPARAMS_DEFAULT = {
-    'optimizer': SparseAdam,
+    'optimizer': optim.Adam,
     'optimizer_kwargs': {'lr': 0.01},
     'vec_size': 50,
     'vec_init_func': np.random.normal,
@@ -153,7 +64,7 @@ class ICFM(nn.Module):
         self.feat2idx = {f: i for i, f in enumerate(feats_unique)}
 
         # Common vector space for all features.
-        self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=True)
+        self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=False)
 
         # Initialize vector space  w/ given distribution and parameters.
         vec_init_kwargs.update({'size': (len(feats_unique), vec_size)})
@@ -162,12 +73,14 @@ class ICFM(nn.Module):
 
         # Initialize weights for each interaction.
         # TODO: make this initialization configurable.
-        self.intr_W = nn.Embedding(len(self.intrs), 1, sparse=True)
+        self.intr_W = nn.Embedding(len(self.intrs), 1, sparse=False)
         self.intr_W.weight.data.normal_(0, 1.0)
 
         # Initialize bias for all interactions.
         # TODO: make this initialization configurable.
-        self.intr_b = nn.Parameter(torch.zeros(1))
+        self.intr_b = nn.Parameter(torch.zeros(1), requires_grad=True)
+        # self.intr_b = nn.Embedding(1, 1, sparse=True)
+        # self.intr_b.weight.data.normal_(0, 0.01)
 
         # Training criteria.
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
@@ -220,8 +133,8 @@ class ICFM(nn.Module):
 
         # Adjust each interaction weight by the interaction frequency for that sample.
         # Multiply each dot product by its adjusted interaction weight.
-        # TODO: Add bias term (problem with sparse/dense gradient).
-        wdb = w[:, 0] / intr_divs_ch * d  # + self.intr_b
+        # Add global bias term.
+        wdb = w[:, 0] / intr_divs_ch * d + self.intr_b
 
         # Sum each sample's indexes to get a scalar for each sample.
         outputs = Variable(torch.zeros(len(smpl_idxs_ch)))
@@ -234,16 +147,15 @@ class ICFM(nn.Module):
         # TODO: Update vectors for missing values.
 
         # Convert keys and feats into torch variables for the forward pass.
-        print('*' * 10)
         t0 = time()
-        ch_vars = self.preprocess_batch(keys, feats)
+        batch_ch = self.preprocess_batch(keys, feats)
         print(time() - t0)
 
         # Forward pass.
         t0 = time()
         self.optimizer.zero_grad()
         yt_ch = Variable(torch.FloatTensor(yt * 1.))
-        yp_ch = self.forward_batch(*ch_vars)
+        yp_ch = self.forward_batch(*batch_ch)
         print(time() - t0)
 
         # Loss, backprop, update.
@@ -495,16 +407,19 @@ class MultiVecRec(object):
         )
         icfm.cuda()
 
-        user_keys = samples['user'].values
-        song_keys = samples['song'].values
+        keys = samples[['user', 'song']].values
         targets = samples['target'].values
 
-        ii = np.random.permutation(len(samples))
-        for i, ii_ in enumerate(np.array_split(ii, ceil(len(ii) / 10000))):
-            keys = np.concatenate((user_keys[ii_, np.newaxis], song_keys[ii_, np.newaxis]), axis=1)
-            t0 = time()
-            loss, acc = icfm.fit_batch(keys, targets[ii_], feats)
-            print('%-5d %.4lf %.4lf %.4lf' % (i, loss, acc, time() - t0))
+        ii = np.random.permutation(len(keys))[:200000]
+
+        for e in range(3):
+            np.random.shuffle(ii)
+            ii_batches = np.array_split(ii, ceil(len(ii) / 10000))
+            for i, ii_ in enumerate(ii_batches):
+                t0 = time()
+                loss, acc = icfm.fit_batch(keys[ii_], targets[ii_], feats)
+                print('%-3d %-5d %.4lf %.4lf %.4lf' % (e, i, loss, acc, time() - t0))
+                print('*' * 10)
 
 
 if __name__ == "__main__":
