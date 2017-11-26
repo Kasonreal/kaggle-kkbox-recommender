@@ -2,6 +2,7 @@ from collections import Counter
 from itertools import product
 from math import log, ceil
 from more_itertools import flatten
+from multiprocessing import Pool, cpu_count
 from os.path import exists
 from os import getenv
 from sklearn.metrics import roc_auc_score
@@ -33,21 +34,45 @@ assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
 
-ICFM_HYPERPARAMS_DEFAULT = {
+IAFM_HYPERPARAMS_DEFAULT = {
     'optimizer': optim.Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'vec_size': 50,
+    'vec_size': 25,
     'vec_init_func': np.random.normal,
     'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
 }
 
 
-class ICFM(nn.Module):
+def iafm_preprocess_batch_parallel(mpargs):
+
+    keys, key2feats, intr2idx, feat2idx = mpargs
+
+    intr_idxs = []  # Index for every interaction in the batch.
+    intr_divs = []  # Divisor for each interaction weight for duplicate interactions.
+    feat_idxs = []  # Feature indexes for pairs of features in the batch.
+    smpl_idxs = []  # Indexes into above lists for every sample.
+
+    # TODO: Many of the feat_idxs are duplicates and could be pruned.
+    for k0, k1 in keys:
+        smpl_idxs.append([])
+        intr_cntr = Counter()
+        for f0, f1 in product(key2feats[k0], key2feats[k1]):
+            smpl_idxs[-1].append(len(intr_idxs))
+            intr_idxs.append(intr2idx[(f0[0], f1[0])])
+            feat_idxs.append([feat2idx[f0], feat2idx[f1]])
+            intr_cntr[intr_idxs[-1]] += 1
+        ntail = len(key2feats[k0] * len(key2feats[k1]))
+        intr_divs += [intr_cntr[i] for i in intr_idxs[-ntail:]]
+
+    return intr_idxs, intr_divs, feat_idxs, smpl_idxs
+
+
+class IAFM(nn.Module):
 
     def __init__(self, grouped_feat_names, feats_unique,
                  optimizer, optimizer_kwargs, vec_size,
                  vec_init_func, vec_init_kwargs, ):
-        super(ICFM, self).__init__()
+        super(IAFM, self).__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
 
         # Compute the possible feature interactions.
@@ -73,14 +98,13 @@ class ICFM(nn.Module):
 
         # Initialize weights for each interaction.
         # TODO: make this initialization configurable.
+        # TODO: make this use nn.Parameter instead of Embedding.
         self.intr_W = nn.Embedding(len(self.intrs), 1, sparse=False)
         self.intr_W.weight.data.normal_(0, 1.0)
 
         # Initialize bias for all interactions.
         # TODO: make this initialization configurable.
         self.intr_b = nn.Parameter(torch.zeros(1), requires_grad=True)
-        # self.intr_b = nn.Embedding(1, 1, sparse=True)
-        # self.intr_b.weight.data.normal_(0, 0.01)
 
         # Training criteria.
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
@@ -90,27 +114,11 @@ class ICFM(nn.Module):
     def _sigmoid(z):
         return 1. / (1 + np.exp(-z))
 
-    def preprocess_batch(self, keys, feats):
+    def preprocess_batch(self, keys, key2feats):
         '''Convert the keys batch into a format that can be efficiently computed.'''
 
-        intr_idxs = []  # Index for ever interaction in the batch.
-        intr_divs = []  # Divisor for each interaction weight for duplicate interactions.
-        feat_idxs = []  # Feature indexes for pairs of features in the batch.
-        smpl_idxs = []  # Indexes into above lists for every sample.
-
-        # TODO: Many of the feat_idxs are duplicates and could be pruned.
-        for k0, k1 in keys:
-            smpl_idxs.append([])
-            intr_cntr = Counter()
-            for f0, f1 in product(feats[k0], feats[k1]):
-                smpl_idxs[-1].append(len(intr_idxs))
-                intr_idxs.append(self.intr2idx[(f0[0], f1[0])])
-                feat_idxs.append([self.feat2idx[f0], self.feat2idx[f1]])
-                intr_cntr[intr_idxs[-1]] += 1
-            tail = len(feats[k0] * len(feats[k1]))
-            intr_divs += [intr_cntr[i] for i in intr_idxs[-tail:]]
-
-        # self.logger.info('Batch with %d samples and %d interactions' % (len(keys), len(intr_idxs)))
+        x = iafm_preprocess_batch_parallel((keys, key2feats, self.intr2idx, self.feat2idx))
+        intr_idxs, intr_divs, feat_idxs, smpl_idxs = x
 
         # Convert indexes to torch-friendly types.
         intr_idxs_ch = Variable(torch.LongTensor(intr_idxs)).cuda()
@@ -173,6 +181,17 @@ class ICFM(nn.Module):
         print(time() - t0)
 
         return loss, auc
+
+    def predict_batch(self, keys, feats, yt=None):
+        batch_ch = self.preprocess_batch(keys, feats)
+        yp_ch = self.forward_batch(*batch_ch)
+        yp = self._sigmoid(yp_ch.data.numpy())
+
+        if yt is not None:
+            auc = roc_auc_score(yt, yp)
+            return yp, auc
+
+        return yp
 
 
 def round_to(n, r):
@@ -383,7 +402,7 @@ class MultiVecRec(object):
 
         return keys, feats
 
-    def fit(self, samples, feats, ii_trn=None, ii_val=None, ICFM_kwargs=ICFM_HYPERPARAMS_DEFAULT):
+    def fit(self, samples, feats, ii_trn=None, ii_val=None, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
 
         # Compute all of the unique feature keys.
         feats_unique = set(flatten(feats.values()))
@@ -400,26 +419,38 @@ class MultiVecRec(object):
         self.logger.info('User feature names: %s' % str(feat_names_user))
         self.logger.info('Song feature names: %s' % str(feat_names_song))
 
-        icfm = ICFM(
+        iafm = IAFM(
             grouped_feat_names=[feat_names_user, feat_names_song],
             feats_unique=feats_unique,
-            **ICFM_kwargs
+            **IAFM_kwargs
         )
-        icfm.cuda()
+        iafm.cuda()
 
         keys = samples[['user', 'song']].values
         targets = samples['target'].values
 
-        ii = np.random.permutation(len(keys))[:200000]
+        p = np.random.permutation(len(keys))
+        ii_trn = p[:1000000]
+        ii_val = p[1000000:1100000]
 
-        for e in range(3):
-            np.random.shuffle(ii)
-            ii_batches = np.array_split(ii, ceil(len(ii) / 10000))
+        for e in range(5):
+            np.random.shuffle(ii_trn)
+            ii_batches = np.array_split(ii_trn, ceil(len(ii_trn) / 10000))
             for i, ii_ in enumerate(ii_batches):
                 t0 = time()
-                loss, acc = icfm.fit_batch(keys[ii_], targets[ii_], feats)
+                loss, acc = iafm.fit_batch(keys[ii_], targets[ii_], feats)
                 print('%-3d %-5d %.4lf %.4lf %.4lf' % (e, i, loss, acc, time() - t0))
                 print('*' * 10)
+
+            ii_batches = np.array_split(ii_val, ceil(len(ii_val) / 10000))
+            mean_auc = 0.
+            for i, ii_ in enumerate(ii_batches):
+                yp, auc = iafm.predict_batch(keys[ii_], feats, targets[ii_])
+                mean_auc += auc / len(ii_batches)
+
+            print('%-3d val auc=%.4lf' % (e, mean_auc))
+
+        pdb.set_trace()
 
 
 if __name__ == "__main__":
