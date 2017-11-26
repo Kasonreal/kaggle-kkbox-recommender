@@ -173,15 +173,20 @@ class ICFM(nn.Module):
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
         self.criterion = nn.BCEWithLogitsLoss()
 
-    def fit_batch(self, keys_batch, yt_batch, feats):
+    @staticmethod
+    def _sigmoid(z):
+        return 1. / (1 + np.exp(-z))
 
-        # Convert the keys batch into a format that can be efficiently batched.
+    def preprocess_batch(self, keys, feats):
+        '''Convert the keys batch into a format that can be efficiently computed.'''
+
         intr_idxs = []  # Index for ever interaction in the batch.
         intr_divs = []  # Divisor for each interaction weight for duplicate interactions.
         feat_idxs = []  # Feature indexes for pairs of features in the batch.
         smpl_idxs = []  # Indexes into above lists for every sample.
 
-        for k0, k1 in tqdm(keys_batch):
+        # TODO: Many of the feat_idxs are duplicates and could be pruned.
+        for k0, k1 in keys:
             smpl_idxs.append([])
             intr_cntr = Counter()
             for f0, f1 in product(feats[k0], feats[k1]):
@@ -192,7 +197,7 @@ class ICFM(nn.Module):
             tail = len(feats[k0] * len(feats[k1]))
             intr_divs += [intr_cntr[i] for i in intr_idxs[-tail:]]
 
-        self.logger.info('Batch with %d samples and %d interactions' % (len(keys_batch), len(intr_idxs)))
+        # self.logger.info('Batch with %d samples and %d interactions' % (len(keys), len(intr_idxs)))
 
         # Convert indexes to torch-friendly types.
         intr_idxs_ch = Variable(torch.LongTensor(intr_idxs)).cuda()
@@ -200,37 +205,62 @@ class ICFM(nn.Module):
         feat_idxs_ch = Variable(torch.LongTensor(feat_idxs)).cuda()
         smpl_idxs_ch = [Variable(torch.LongTensor(x)).cuda() for x in smpl_idxs]
 
-        # Forward pass.
-        yp_ch = self.forward(intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch)
+        return intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch
 
-        # Loss, backprop, update.
-
-        # Update vectors for missing values.
-
-        pdb.set_trace()
-
-    def forward(self, intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch):
+    def forward_batch(self, intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch):
 
         # Use the feat_idxs to retrieve vectors.
-        V_ = self.vecs(feat_idxs_ch)
+        v = self.vecs(feat_idxs_ch)
 
         # Dot products across sample axis.
-        D_ = torch.sum(torch.prod(V_, dim=1), dim=1)
+        d = torch.sum(torch.prod(v, dim=1), dim=1)
 
         # Use the intr_idxs to retrieve interaction weights.
-        W_ = self.intr_W(intr_idxs_ch)
+        w = self.intr_W(intr_idxs_ch)
 
-        # Divide each interaction weight by the interaction frequency for that sample.
-        # Multiply each of the dot products by its adjusted interaction weight.
-        # Add bias.
-        WDb_ = W_[:, 0] / intr_divs_ch * D_ + self.intr_b
+        # Adjust each interaction weight by the interaction frequency for that sample.
+        # Multiply each dot product by its adjusted interaction weight.
+        # TODO: Add bias term (problem with sparse/dense gradient).
+        wdb = w[:, 0] / intr_divs_ch * d  # + self.intr_b
 
         # Sum each sample's indexes to get a scalar for each sample.
         outputs = Variable(torch.zeros(len(smpl_idxs_ch)))
         for i, idxs_ch in enumerate(smpl_idxs_ch):
-            outputs[i] = torch.sum(WDb_[idxs_ch])
-
+            outputs[i] = torch.sum(wdb[idxs_ch].cpu())
         return outputs
+
+    def fit_batch(self, keys, yt, feats):
+
+        # TODO: Update vectors for missing values.
+
+        # Convert keys and feats into torch variables for the forward pass.
+        print('*' * 10)
+        t0 = time()
+        ch_vars = self.preprocess_batch(keys, feats)
+        print(time() - t0)
+
+        # Forward pass.
+        t0 = time()
+        self.optimizer.zero_grad()
+        yt_ch = Variable(torch.FloatTensor(yt * 1.))
+        yp_ch = self.forward_batch(*ch_vars)
+        print(time() - t0)
+
+        # Loss, backprop, update.
+        t0 = time()
+        loss = self.criterion(yp_ch, yt_ch)
+        loss.backward()
+        self.optimizer.step()
+        print(time() - t0)
+
+        # Metrics.
+        t0 = time()
+        loss = loss.cpu().data.numpy()[0]
+        yp = self._sigmoid(yp_ch.data.numpy())
+        auc = roc_auc_score(yt, yp)
+        print(time() - t0)
+
+        return loss, auc
 
 
 def round_to(n, r):
@@ -469,17 +499,12 @@ class MultiVecRec(object):
         song_keys = samples['song'].values
         targets = samples['target'].values
 
-        keys_batch, yt_batch = [], []
-        for i in range(1000):
-            keys_batch.append([user_keys[i], song_keys[i]])
-            yt_batch.append(targets[i])
-
-        # keys_batch = [[user_keys[i], song_keys[i]] for i in range(50000)]
-        icfm.fit_batch(keys_batch, yt_batch, feats)
-
-        pdb.set_trace()
-
-    pass
+        ii = np.random.permutation(len(samples))
+        for i, ii_ in enumerate(np.array_split(ii, ceil(len(ii) / 10000))):
+            keys = np.concatenate((user_keys[ii_, np.newaxis], song_keys[ii_, np.newaxis]), axis=1)
+            t0 = time()
+            loss, acc = icfm.fit_batch(keys, targets[ii_], feats)
+            print('%-5d %.4lf %.4lf %.4lf' % (i, loss, acc, time() - t0))
 
 
 if __name__ == "__main__":
