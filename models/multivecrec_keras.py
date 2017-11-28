@@ -1,10 +1,10 @@
 from collections import Counter
 from math import log, ceil
-from more_itertools import flatten
+from more_itertools import flatten, chunked
 from multiprocessing import Pool, cpu_count
 from os.path import exists
 from os import getenv
-from sklearn.metrics import roc_auc_score, log_loss
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from time import time
 from tqdm import tqdm
@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pickle
 import pdb
-import sys
+import tensorflow as tf
 
 NTRN = 7377418
 NTST = 2556790
@@ -28,6 +28,7 @@ from keras.models import Model, load_model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
 from keras.regularizers import l2
+from keras.callbacks import LambdaCallback
 import keras.backend as K
 
 IAFM_HYPERPARAMS_DEFAULT = {
@@ -36,7 +37,7 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'nb_epochs_max': 15,
+    'nb_epochs_max': 5,
     'batch_size': 50000,
     'early_stop_metric': 'loss',
     'early_stop_delta': 0.05,
@@ -113,33 +114,48 @@ class IAFM(object):
         return net
 
     def gen(self, X, y):
-        rng = np.random
-        nb_batches = ceil(len(X) / self.batch_size)
+        bii = np.arange(len(X))
         while True:
-            for bii_ in np.array_split(rng.permutation(len(X)), nb_batches):
-                X_0 = np.empty((len(bii_), self.nb_vii_max), dtype=np.uint32)
-                X_1 = np.empty((len(bii_), self.nb_vii_max), dtype=np.uint32)
-                X_2 = np.empty((len(bii_), 1), dtype=np.float32)
+            np.random.shuffle(bii)
+            for bii_ in chunked(bii, self.batch_size):
+                X_0, X_1, X_2 = [], [], []
                 for i, (k0, k1) in enumerate(X[bii_]):
-                    X_0[i] = self.key2vii[k0]
-                    X_1[i] = self.key2vii[k1]
-                    X_2[i] = 1. / (self.key2len[k0] * self.key2len[k1])
+                    X_0.append(self.key2vii[k0])
+                    X_1.append(self.key2vii[k1])
+                    X_2.append(1. / (self.key2len[k0] * self.key2len[k1]))
+                X_0 = np.array(X_0)
+                X_1 = np.array(X_1)
+                X_2 = np.array(X_2)
                 yield [X_0, X_1, X_2], y[bii_]
 
     def fit(self, Xt, Xv, yt, yv):
 
-        gt = self.gen(Xt, yt)
-        gv = self.gen(Xv, yv)
+        def auc_roc(y_true, y_pred):
+            """https://github.com/fchollet/keras/issues/6050"""
+            # value, update_op = tf.contrib.metrics.streaming_auc(y_pred, y_true)
+            value, update_op = tf.metrics.auc(y_pred, y_true)
+            metric_vars = [i for i in tf.local_variables() if 'auc_roc' in i.name.split('/')[1]]
+            for v in metric_vars:
+                tf.add_to_collection(tf.GraphKeys.GLOBAL_VARIABLES, v)
+            with tf.control_dependencies([update_op]):
+                value = tf.identity(value)
+                return value
 
         net = self.net()
         opt = self.optimizer(**self.optimizer_kwargs)
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
+        gt = self.gen(Xt, yt)
+        gv = self.gen(Xv, yv)
 
+        cb = []
+
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[])
         net.fit_generator(
-            epochs=self.nb_epochs_max,
+            epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1,
             generator=gt, steps_per_epoch=ceil(len(Xt) / self.batch_size),
-            validation_data=gv, validation_steps=ceil(len(Xv) / self.batch_size),
+            validation_data=gv, validation_steps=ceil(len(Xv) / self.batch_size)
         )
+
+        pdb.set_trace()
 
 
 def round_to(n, r):
@@ -363,11 +379,10 @@ class MultiVecRec(object):
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, **IAFM_kwargs)
-
         X = samples[['user', 'song']].values
         targets = samples['target'].values
-
-        iafm.fit(*train_test_split(X, targets, test_size=0.5))
+        data = train_test_split(X, targets, test_size=0.5, random_state=np.random)
+        iafm.fit(*data)
 
 if __name__ == "__main__":
 
