@@ -1,15 +1,14 @@
 from collections import Counter
-from itertools import product
 from math import log, ceil
 from more_itertools import flatten
 from multiprocessing import Pool, cpu_count
 from os.path import exists
 from os import getenv
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, log_loss
+from sklearn.model_selection import train_test_split
 from time import time
 from tqdm import tqdm
 import argparse
-import json
 import logging
 import numpy as np
 import pandas as pd
@@ -37,10 +36,10 @@ IAFM_HYPERPARAMS_DEFAULT = {
     # https://discuss.pytorch.org/t/bug-of-nn-embedding-when-sparse-true-and-padding-idx-is-set/9382/2
 
     'optimizer_kwargs': {'lr': 0.01},
-    'vec_size': 60,
+    'vec_size': 25,
     'vec_init_func': np.random.normal,
     'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
-    'nb_epochs_max': 100,
+    'nb_epochs_max': 15,
     'batch_size': 40000,
     'early_stop_delta': 0.05,
     'early_stop_patience': 2,
@@ -48,6 +47,8 @@ IAFM_HYPERPARAMS_DEFAULT = {
 
 
 class IAFM(nn.Module):
+
+    # TODO: add dropout that randomly removes interactions to improve generalization.
 
     def __init__(self, key2feats, optimizer, optimizer_kwargs, vec_size,
                  vec_init_func, vec_init_kwargs, nb_epochs_max, batch_size,
@@ -89,7 +90,7 @@ class IAFM(nn.Module):
     def _sigmoid(z):
         return 1. / (1 + np.exp(-z))
 
-    def fit(self, key_pairs_trn, targets_trn, key_pairs_val=[], targets_val=None):
+    def fit(self, Xtrn, ytrn, Xval, yval):
 
         # Map key -> [padded list of the indexes].
         # Map key -> number of valid (non-padded) indexes in index list.
@@ -103,69 +104,89 @@ class IAFM(nn.Module):
         # Now all lists of indexes have equivalent length.
         assert len(set(map(len, key2vii.values()))) == 1
 
-        nb_batches_trn = ceil(len(key_pairs_trn) / self.batch_size)
-        nb_batches_val = ceil(len(key_pairs_val or []) / self.batch_size)
+        nb_batches_trn = ceil(len(Xtrn) / self.batch_size)
+        nb_batches_val = ceil(len(Xval) / self.batch_size)
 
         for ei in range(self.nb_epochs_max):
 
-            # Batched permutation of indexes.
-            ii_trn = np.random.permutation(len(key_pairs_trn))
+            # Batched permutation of training indexes.
+            ii_trn = np.random.permutation(len(Xtrn))
             ii_trn = np.array_split(ii_trn, nb_batches_trn)
 
             # Iterate through permutation of training samples.
-            for bi, ii_trn_ in enumerate(ii_trn):
+            for bi, ii_ in enumerate(ii_trn):
                 t0 = time()
-                pt, loss = self.forward(key_pairs_trn[ii_trn_, 0],
-                                        key_pairs_trn[ii_trn_, 1],
-                                        key2vii, key2len,
-                                        targets_trn[ii_trn_])
-                auc = roc_auc_score(targets_trn[ii_trn_], pt)
-                print('%-3d %-3d %.3lf %.3lf %.4lf' %
-                      (ei, bi, loss, auc, time() - t0))
+                yp, loss, auc = self.forward(Xtrn[ii_], ytrn[ii_], key2vii, key2len, True)
+                self.logger.info('%-3d %-.2lf %.4lf %.4lf %.4lf' %
+                                 (ei, bi / len(ii_trn) * 100, loss, auc, time() - t0))
+
+            # Batched permutation of training indexes.
+            ii_val = np.random.permutation(len(Xval))
+            ii_val = np.array_split(ii_val, nb_batches_val)
+
+            # Iterate through permutation of training samples.
+            t0 = time()
+            mean_loss = mean_auc = 0.
+            for bi, ii_ in enumerate(ii_val):
+                yp, loss, auc = self.forward(Xval[ii_], yval[ii_], key2vii, key2len, False)
+                mean_loss += loss / len(ii_val)
+                mean_auc += auc / len(ii_val)
+
+            s = 'Val %d: %.3lf %.4lf %.4lf' % (ei, mean_loss, mean_auc, time() - t0)
+            self.logger.info('*' * len(s))
+            self.logger.info(s)
+            self.logger.info('*' * len(s))
 
             pass
 
-    def forward(self, kk0, kk1, key2vii, key2len, tt=None):
+    def forward(self, X, yt, key2vii, key2len, update):
+
+        volatile = not update
+
+        if update:
+            self.optimizer.zero_grad()
 
         ii0, ii1, nb_inters = [], [], []
-        for k0, k1 in zip(kk0, kk1):
+        for k0, k1 in X:
             ii0.append(key2vii[k0])
             ii1.append(key2vii[k1])
             nb_inters.append(key2len[k0] * key2len[k1])
 
         # Convert to torch variables.
-        ii0_ch = Variable(torch.LongTensor(ii0)).cuda()
-        ii1_ch = Variable(torch.LongTensor(ii1)).cuda()
+        ii0_ch = Variable(torch.LongTensor(ii0), volatile=volatile).cuda()
+        ii1_ch = Variable(torch.LongTensor(ii1), volatile=volatile).cuda()
 
         # Retrieve as two batches of vectors.
         vv0_ch = self.vecs(ii0_ch)
         vv1_ch = self.vecs(ii1_ch)
 
         # Matrix multiply to get all possible vector interaction dot products.
-        # The padding vectors' products will be 0.
+        # The padding vectors' products will be 0 and gradients will be ignored.
         muls_ch = torch.matmul(vv0_ch, vv1_ch.transpose(2, 1))
 
         # Sum each sample's interactions.
         sums_ch = muls_ch.sum(-1).sum(-1)
 
         # Divide by the number of interactions in each sample to get predicted target.
-        nb_inters_ch = Variable(torch.FloatTensor(nb_inters), requires_grad=False).cuda()
-        pt_ch = sums_ch / nb_inters_ch
-        pt = self._sigmoid(pt_ch.cpu().data.numpy())
+        nb_inters_ch = Variable(torch.FloatTensor(nb_inters), requires_grad=False, volatile=volatile).cuda()
+        yp_ch = sums_ch / nb_inters_ch
+        yp = self._sigmoid(yp_ch.cpu().data.numpy())
 
-        # No true targets given, just return predicted targets.
-        if tt is None:
-            return pt
+        if yt is None and not update:
+            return yp
 
-        # Compute the loss and make a gradient update.
-        tt_ch = Variable(torch.FloatTensor(tt * 1.)).cuda()
-        loss_ch = self.criterion(pt_ch, tt_ch)
-        loss_ch.backward()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        # Compute the loss.
+        yt_ch = Variable(torch.FloatTensor(yt * 1.)).cuda()
+        loss_ch = self.criterion(yp_ch, yt_ch)
+
+        # Make a gradient update
+        if update:
+            loss_ch.backward()
+            self.optimizer.step()
 
         loss = loss_ch.cpu().data.numpy()[0]
-        return pt, loss
+        auc = roc_auc_score(yt, yp)
+        return yp, loss, auc
 
 
 def round_to(n, r):
@@ -382,9 +403,14 @@ class MultiVecRec(object):
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, **IAFM_kwargs)
         iafm.cuda()
-        key_pairs = samples[['user', 'song']].values
+
+        X = samples[['user', 'song']].values
         targets = samples['target'].values
-        iafm.fit(key_pairs, targets)
+
+        x = train_test_split(X, targets, test_size=0.5)
+        Xtrn, Xval, ytrn, yval = x
+
+        iafm.fit(Xtrn, ytrn, Xval, yval)
 
 if __name__ == "__main__":
 
