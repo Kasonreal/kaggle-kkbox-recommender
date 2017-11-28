@@ -27,171 +27,143 @@ NTRN = 7377418
 NTST = 2556790
 np.random.seed(865)
 
-# Reserved index for missing values.
-MISSING = 'MISSING'
-
 assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
-
 IAFM_HYPERPARAMS_DEFAULT = {
     'optimizer': optim.Adam,
+    # Must use regular (not sparse) Adam. See bug:
+    # https://discuss.pytorch.org/t/bug-of-nn-embedding-when-sparse-true-and-padding-idx-is-set/9382/2
     'optimizer_kwargs': {'lr': 0.01},
-    'vec_size': 25,
+    'vec_size': 50,
     'vec_init_func': np.random.normal,
     'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
+    'nb_epochs_max': 100,
+    'batch_size': 10000,
+    'early_stop_delta': 0.05,
+    'early_stop_patience': 2,
 }
-
-
-def iafm_preprocess_batch_parallel(mpargs):
-
-    keys, key2feats, intr2idx, feat2idx = mpargs
-
-    intr_idxs = []  # Index for every interaction in the batch.
-    intr_divs = []  # Divisor for each interaction weight for duplicate interactions.
-    feat_idxs = []  # Feature indexes for pairs of features in the batch.
-    smpl_idxs = []  # Indexes into above lists for every sample.
-
-    # TODO: Many of the feat_idxs are duplicates and could be pruned.
-    for k0, k1 in keys:
-        smpl_idxs.append([])
-        intr_cntr = Counter()
-        for f0, f1 in product(key2feats[k0], key2feats[k1]):
-            smpl_idxs[-1].append(len(intr_idxs))
-            intr_idxs.append(intr2idx[(f0[0], f1[0])])
-            feat_idxs.append([feat2idx[f0], feat2idx[f1]])
-            intr_cntr[intr_idxs[-1]] += 1
-        ntail = len(key2feats[k0] * len(key2feats[k1]))
-        intr_divs += [intr_cntr[i] for i in intr_idxs[-ntail:]]
-
-    return intr_idxs, intr_divs, feat_idxs, smpl_idxs
 
 
 class IAFM(nn.Module):
 
-    def __init__(self, grouped_feat_names, feats_unique,
-                 optimizer, optimizer_kwargs, vec_size,
-                 vec_init_func, vec_init_kwargs, ):
+    def __init__(self, key2feats, optimizer, optimizer_kwargs, vec_size,
+                 vec_init_func, vec_init_kwargs, nb_epochs_max, batch_size,
+                 early_stop_delta, early_stop_patience):
         super(IAFM, self).__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # Compute the possible feature interactions.
-        # Feature interactions are denoted as tuples of feature names.
-        self.intrs = grouped_feat_names[0]
-        for feat_names in grouped_feat_names[1:]:
-            self.intrs = list(product(self.intrs, feat_names))
-        self.logger.info('%d feature interactions' % len(self.intrs))
+        # Keep the key -> features mapping.
+        self.key2feats = key2feats
 
-        # Lookup feature interaction -> weight index.
-        self.intr2idx = {f: i for i, f in enumerate(self.intrs)}
+        # Compute all of the unique feature keys.
+        feats_unique = set(flatten(self.key2feats.values()))
+        self.logger.info('Identified %d unique features' % len(feats_unique))
 
-        # Lookup feature -> vector index.
-        self.feat2idx = {f: i for i, f in enumerate(feats_unique)}
+        # Map feature -> vector index. Add 1 to account for padding index.
+        self.feat2ii = {f: i + 1 for i, f in enumerate(feats_unique)}
 
-        # Common vector space for all features.
-        self.vecs = nn.Embedding(len(feats_unique), vec_size, sparse=False)
+        # One vector space for all features. One vector is kept empty for padding.
+        self.vecs = nn.Embedding(max(self.feat2ii.values()) + 1, vec_size, padding_idx=0, sparse=False)
+        self.PADDING_VEC_I = self.vecs.padding_idx
 
         # Initialize vector space  w/ given distribution and parameters.
-        vec_init_kwargs.update({'size': (len(feats_unique), vec_size)})
+        vec_init_kwargs.update({'size': tuple(self.vecs.weight.size())})
         vw = vec_init_func(**vec_init_kwargs)
         self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
-
-        # Initialize weights for each interaction.
-        # TODO: make this initialization configurable.
-        # TODO: make this use nn.Parameter instead of Embedding.
-        self.intr_W = nn.Embedding(len(self.intrs), 1, sparse=False)
-        self.intr_W.weight.data.normal_(0, 1.0)
-
-        # Initialize bias for all interactions.
-        # TODO: make this initialization configurable.
-        self.intr_b = nn.Parameter(torch.zeros(1), requires_grad=True)
 
         # Training criteria.
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
         self.criterion = nn.BCEWithLogitsLoss()
 
+        # Training details.
+        self.nb_epochs_max = nb_epochs_max
+        self.batch_size = batch_size
+        self.early_stop_delta = early_stop_delta
+        self.early_stop_patience = early_stop_patience
+
     @staticmethod
     def _sigmoid(z):
         return 1. / (1 + np.exp(-z))
 
-    def preprocess_batch(self, keys, key2feats):
-        '''Convert the keys batch into a format that can be efficiently computed.'''
+    def fit(self, key_pairs_trn, targets_trn, key_pairs_val=[], targets_val=None):
 
-        x = iafm_preprocess_batch_parallel((keys, key2feats, self.intr2idx, self.feat2idx))
-        intr_idxs, intr_divs, feat_idxs, smpl_idxs = x
+        # Map key -> [padded list of the indexes].
+        # Map key -> number of valid (non-padded) indexes in index list.
+        nb_ii_max = max(map(len, self.key2feats.values()))
+        key2vii, key2len = {}, {}
+        for k, v in self.key2feats.items():
+            padding = [self.PADDING_VEC_I] * (nb_ii_max - len(v))
+            key2vii[k] = [self.feat2ii[f] for f in v] + padding
+            key2len[k] = len(v)
 
-        # Convert indexes to torch-friendly types.
-        intr_idxs_ch = Variable(torch.LongTensor(intr_idxs)).cuda()
-        intr_divs_ch = Variable(torch.FloatTensor(intr_divs)).cuda()
-        feat_idxs_ch = Variable(torch.LongTensor(feat_idxs)).cuda()
-        smpl_idxs_ch = [Variable(torch.LongTensor(x)).cuda() for x in smpl_idxs]
+        # Now all lists of indexes have equivalent length.
+        assert len(set(map(len, key2vii.values()))) == 1
 
-        return intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch
+        nb_batches_trn = ceil(len(key_pairs_trn) / self.batch_size)
+        nb_batches_val = ceil(len(key_pairs_val or []) / self.batch_size)
 
-    def forward_batch(self, intr_idxs_ch, intr_divs_ch, feat_idxs_ch, smpl_idxs_ch):
+        for ei in range(self.nb_epochs_max):
 
-        # Use the feat_idxs to retrieve vectors.
-        v = self.vecs(feat_idxs_ch)
+            # Batched permutation of indexes.
+            ii_trn = np.random.permutation(len(key_pairs_trn))
+            ii_trn = np.array_split(ii_trn, nb_batches_trn)
 
-        # Dot products across sample axis.
-        d = torch.sum(torch.prod(v, dim=1), dim=1)
+            # Iterate through permutation of training samples.
+            for bi, ii_trn_ in enumerate(ii_trn):
+                t0 = time()
+                pt, loss = self.forward(key_pairs_trn[ii_trn_, 0],
+                                        key_pairs_trn[ii_trn_, 1],
+                                        key2vii, key2len,
+                                        targets_trn[ii_trn_])
+                auc = roc_auc_score(targets_trn[ii_trn_], pt)
+                print('%-3d %-3d %.3lf %.3lf %.4lf' %
+                      (ei, bi, loss, auc, time() - t0))
 
-        # Use the intr_idxs to retrieve interaction weights.
-        w = self.intr_W(intr_idxs_ch)
+            pass
 
-        # Adjust each interaction weight by the interaction frequency for that sample.
-        # Multiply each dot product by its adjusted interaction weight.
-        # Add global bias term.
-        wdb = w[:, 0] / intr_divs_ch * d + self.intr_b
+    def forward(self, kk0, kk1, key2vii, key2len, tt=None):
 
-        # Sum each sample's indexes to get a scalar for each sample.
-        outputs = Variable(torch.zeros(len(smpl_idxs_ch)))
-        for i, idxs_ch in enumerate(smpl_idxs_ch):
-            outputs[i] = torch.sum(wdb[idxs_ch].cpu())
-        return outputs
+        ii0, ii1, nb_inters = [], [], []
+        for k0, k1 in zip(kk0, kk1):
+            ii0.append(key2vii[k0])
+            ii1.append(key2vii[k1])
+            nb_inters.append(key2len[k0] * key2len[k1])
 
-    def fit_batch(self, keys, yt, feats):
+        # Convert to torch variables.
+        ii0_ch = Variable(torch.LongTensor(ii0))
+        ii1_ch = Variable(torch.LongTensor(ii1))
 
-        # TODO: Update vectors for missing values.
+        # Retrieve as two batches of vectors.
+        vv0_ch = self.vecs(ii0_ch)
+        vv1_ch = self.vecs(ii1_ch)
 
-        # Convert keys and feats into torch variables for the forward pass.
-        t0 = time()
-        batch_ch = self.preprocess_batch(keys, feats)
-        print(time() - t0)
+        # Matrix multiply to get all possible vector interaction dot products.
+        # The padding vectors' products will be 0.
+        muls_ch = torch.matmul(vv0_ch, vv1_ch.transpose(2, 1))
 
-        # Forward pass.
-        t0 = time()
-        self.optimizer.zero_grad()
-        yt_ch = Variable(torch.FloatTensor(yt * 1.))
-        yp_ch = self.forward_batch(*batch_ch)
-        print(time() - t0)
+        # Sum each sample's interactions.
+        sums_ch = muls_ch.sum(-1).sum(-1)
 
-        # Loss, backprop, update.
-        t0 = time()
-        loss = self.criterion(yp_ch, yt_ch)
-        loss.backward()
+        # Divide by the number of interactions in each sample.
+        nb_inters_ch = Variable(torch.FloatTensor(nb_inters), requires_grad=False)
+        pt_ch = sums_ch / nb_inters_ch
+        # pt_ch = sums_ch
+        pt = self._sigmoid(pt_ch.cpu().data.numpy())
+
+        # No true targets given, just return predicted targets.
+        if tt is None:
+            return pt
+
+        # Compute the loss and make a gradient update.
+        tt_ch = Variable(torch.FloatTensor(tt * 1.))
+        loss_ch = self.criterion(pt_ch, tt_ch)
+        loss_ch.backward()
         self.optimizer.step()
-        print(time() - t0)
+        self.optimizer.zero_grad()
 
-        # Metrics.
-        t0 = time()
-        loss = loss.cpu().data.numpy()[0]
-        yp = self._sigmoid(yp_ch.data.numpy())
-        auc = roc_auc_score(yt, yp)
-        print(time() - t0)
-
-        return loss, auc
-
-    def predict_batch(self, keys, feats, yt=None):
-        batch_ch = self.preprocess_batch(keys, feats)
-        yp_ch = self.forward_batch(*batch_ch)
-        yp = self._sigmoid(yp_ch.data.numpy())
-
-        if yt is not None:
-            auc = roc_auc_score(yt, yp)
-            return yp, auc
-
-        return yp
+        loss = loss_ch.cpu().data.numpy()[0]
+        return pt, loss
 
 
 def round_to(n, r):
@@ -211,40 +183,44 @@ def get_user_feats(df):
     keys_dedup = df['msno'].apply(msno2key).values.tolist()
 
     # Build mapping from unique keys to features.
-    keys2feats = {k: [] for k in keys_dedup}
+    key2feats = {}
 
     for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
+        key2feats[k] = []
+
         # User msno (id).
-        keys2feats[k].append(('u-msno', row['msno']))
+        key2feats[k].append(('u-msno', row['msno']))
 
         # User age. Clipped and rounded.
-        if not (0 < row['bd'] < 70):
-            keys2feats[k].append(('u-age', MISSING))
-        else:
-            keys2feats[k].append(('u-age', round_to(row['bd'], 5)))
+        if 0 < row['bd'] < 70:
+            key2feats[k].append(('u-age', round_to(row['bd'], 5)))
 
         # User city. No missing values.
-        keys2feats[k].append(('u-city', int(row['city'])))
+        key2feats[k].append(('u-city', int(row['city'])))
 
         # User gender. Missing if not female or male.
-        if row['gender'] not in {'male', 'female'}:
-            keys2feats[k].append(('u-sex', MISSING))
-        else:
-            keys2feats[k].append(('u-sex', row['gender']))
+        if row['gender'] in {'male', 'female'}:
+            key2feats[k].append(('u-sex', row['gender']))
 
         # User registration method. No missing values.
-        keys2feats[k].append(('u-reg-via', int(row['registered_via'])))
+        key2feats[k].append(('u-reg-via', int(row['registered_via'])))
 
         # User registration year. No missing values.
         y0 = int(str(row['registration_init_time'])[:4])
-        keys2feats[k].append(('u-reg-year', y0))
+        key2feats[k].append(('u-reg-year', y0))
 
-        # User account age, in years. No missing values.
-        y1 = int(str(row['expiration_date'])[:4])
-        keys2feats[k].append(('u-act-age', y1 - y0))
+    return keys, key2feats
 
-    return keys, keys2feats
+
+def split_multi(maybe_vals):
+    if type(maybe_vals) == str:
+        split = maybe_vals.split('|')
+        try:
+            return [int(x) for x in split]
+        except ValueError as ex:
+            return [x.strip() for x in split]
+    return []
 
 
 def get_song_feats(df):
@@ -253,69 +229,68 @@ def get_song_feats(df):
     songid2key = lambda x: 's-%s' % x
     keys = df['song_id'].apply(songid2key).values.tolist()
 
+    # Count the instances of each musician and genre.
+    # Musicians encompass artist, composer, and lyricist.
+    t0 = time()
+    pool = Pool(cpu_count())
+    musicians = flatten(pool.map(split_multi,
+                                 df['artist_name'].values.tolist() +
+                                 df['lyricist'].values.tolist() +
+                                 df['composer'].values.tolist()))
+    musician_counts = Counter(musicians)
+    print('%.4lf' % (time() - t0))
+
+    genre_ids = flatten(pool.map(split_multi, df['genre_ids'].values.tolist()))
+    genre_id_counts = Counter(genre_ids)
+    print('%.4lf' % (time() - t0))
+    pool.close()
+
     # Remove duplicates.
     df = df.drop_duplicates('song_id')
     keys_dedup = df['song_id'].apply(songid2key).values.tolist()
 
     # Build mapping from unique keys to features.
-    keys2feats = {k: [] for k in keys_dedup}
+    key2feats = {}
 
     for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
+        key2feats[k] = []
+
         # Song id.
-        keys2feats[k].append(('s-id', row['song_id']))
+        key2feats[k].append(('s-id', row['song_id']))
 
         # Song length. Missing if nan.
-        if np.isnan(row['song_length']):
-            keys2feats[k].append(('s-len', MISSING))
-        else:
+        if not np.isnan(row['song_length']):
             f = row['song_length'] / 1000 / 60
             f = round(log(max(1, f)))
-            keys2feats[k].append(('s-len', f))
+            key2feats[k].append(('s-len', f))
 
         # Song language. Missing if nan.
-        if np.isnan(row['language']):
-            keys2feats[k].append(('s-lang', MISSING))
-        else:
-            keys2feats[k].append(('s-lang', int(row['language'])))
+        if not np.isnan(row['language']):
+            key2feats[k].append(('s-lang', int(row['language'])))
 
         # Song year. Missing if nan. Rounded to 3-year intervals.
         # Song country. Missing if nan.
-        if type(row['isrc']) is not str:
-            keys2feats[k].append(('s-year', MISSING))
-            keys2feats[k].append(('s-country', MISSING))
-        else:
+        if type(row['isrc']) is str:
             f = int(round_to(int(row['isrc'][5:7]), 3))
-            keys2feats[k].append(('s-year', f))
-            keys2feats[k].append(('s-country', row['isrc'][:2]))
+            key2feats[k].append(('s-year', f))
+            key2feats[k].append(('s-country', row['isrc'][:2]))
 
         # Song genre(s). Missing if nan. Split on pipes.
-        if type(row['genre_ids']) is not str:
-            keys2feats[k].append(('s-genre', MISSING))
-        else:
-            for g in row['genre_ids'].split('|'):
-                keys2feats[k].append(('s-genre', int(g)))
+        gg = split_multi(row['genre_ids'])
+        if len(gg) > 0:
+            ggc = map(genre_id_counts.get, gg)
+            key2feats[k].append(('s-genre', gg[np.argmax(ggc)]))
 
-        # Song musicians. Combine artist, composer, lyricist.
-        if str not in {type(row['artist_name']), type(row['composer']), type('lyricist')}:
-            keys2feats[k].append('s-musician', MISSING)
+        # TODO: consider artist, lyricist, musician separately.
+        mm = split_multi(row['artist_name'])
+        mm += split_multi(row['lyricist'])
+        mm += split_multi(row['composer'])
+        if len(mm) > 0:
+            mmc = map(musician_counts.get, mm)
+            key2feats[k].append(('s-musician', mm[np.argmax(mmc)]))
 
-        # Artist. Missing if nan, but already accounted for.
-        if type(row['artist_name']) == str:
-            for m in row['artist_name'].split('|'):
-                keys2feats[k].append(('s-musician', m.strip()))
-
-        # Composer. Missing if nan, but already accounted for.
-        if type(row['composer']) == str:
-            for m in row['composer'].split('|'):
-                keys2feats[k].append(('s-musician', m.strip()))
-
-        # Lyricist. Missing if nan, but already accounted for.
-        if type(row['lyricist']) == str:
-            for m in row['lyricist'].split('|'):
-                keys2feats[k].append(('s-musician', m.strip()))
-
-    return keys, keys2feats
+    return keys, key2feats
 
 
 class MultiVecRec(object):
@@ -365,16 +340,16 @@ class MultiVecRec(object):
             # Throw away unused after merging.
             del SEI, MMB
 
-            self.logger.info('Encoding user features')
-            ukeys, ukeys2feats = get_user_feats(CMB)
-
             self.logger.info('Encoding song features')
-            skeys, skeys2feats = get_song_feats(CMB)
+            skeys, skey2feats = get_song_feats(CMB)
+
+            self.logger.info('Encoding user features')
+            ukeys, ukey2feats = get_user_feats(CMB)
 
             self.logger.info('Saving features')
             with open(path_feats, 'wb') as fp:
-                feats = ukeys2feats.copy()
-                feats.update(skeys2feats)
+                feats = ukey2feats.copy()
+                feats.update(skey2feats)
                 pickle.dump(feats, fp)
 
             self.logger.info('Saving training keys')
@@ -402,56 +377,11 @@ class MultiVecRec(object):
 
         return keys, feats
 
-    def fit(self, samples, feats, ii_trn=None, ii_val=None, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
-
-        # Compute all of the unique feature keys.
-        feats_unique = set(flatten(feats.values()))
-        self.logger.info('Identified %d unique features' % len(feats_unique))
-
-        # Names of user features.
-        feat_names_user, feat_names_song = set(), set()
-        for feat_name, feat in feats_unique:
-            if feat_name.startswith('u-'):
-                feat_names_user.add(feat_name)
-            elif feat_name.startswith('s-'):
-                feat_names_song.add(feat_name)
-
-        self.logger.info('User feature names: %s' % str(feat_names_user))
-        self.logger.info('Song feature names: %s' % str(feat_names_song))
-
-        iafm = IAFM(
-            grouped_feat_names=[feat_names_user, feat_names_song],
-            feats_unique=feats_unique,
-            **IAFM_kwargs
-        )
-        iafm.cuda()
-
-        keys = samples[['user', 'song']].values
+    def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        iafm = IAFM(key2feats, **IAFM_kwargs)
+        key_pairs = samples[['user', 'song']].values
         targets = samples['target'].values
-
-        p = np.random.permutation(len(keys))
-        ii_trn = p[:1000000]
-        ii_val = p[1000000:1100000]
-
-        for e in range(5):
-            np.random.shuffle(ii_trn)
-            ii_batches = np.array_split(ii_trn, ceil(len(ii_trn) / 10000))
-            for i, ii_ in enumerate(ii_batches):
-                t0 = time()
-                loss, acc = iafm.fit_batch(keys[ii_], targets[ii_], feats)
-                print('%-3d %-5d %.4lf %.4lf %.4lf' % (e, i, loss, acc, time() - t0))
-                print('*' * 10)
-
-            ii_batches = np.array_split(ii_val, ceil(len(ii_val) / 10000))
-            mean_auc = 0.
-            for i, ii_ in enumerate(ii_batches):
-                yp, auc = iafm.predict_batch(keys[ii_], feats, targets[ii_])
-                mean_auc += auc / len(ii_batches)
-
-            print('%-3d val auc=%.4lf' % (e, mean_auc))
-
-        pdb.set_trace()
-
+        iafm.fit(key_pairs, targets)
 
 if __name__ == "__main__":
 
