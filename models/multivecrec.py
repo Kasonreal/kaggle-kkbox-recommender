@@ -31,15 +31,17 @@ assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
 IAFM_HYPERPARAMS_DEFAULT = {
+
     'optimizer': optim.Adam,
     # Must use regular (not sparse) Adam. See bug:
     # https://discuss.pytorch.org/t/bug-of-nn-embedding-when-sparse-true-and-padding-idx-is-set/9382/2
+
     'optimizer_kwargs': {'lr': 0.01},
-    'vec_size': 50,
+    'vec_size': 60,
     'vec_init_func': np.random.normal,
     'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
     'nb_epochs_max': 100,
-    'batch_size': 10000,
+    'batch_size': 40000,
     'early_stop_delta': 0.05,
     'early_stop_patience': 2,
 }
@@ -64,7 +66,8 @@ class IAFM(nn.Module):
         self.feat2ii = {f: i + 1 for i, f in enumerate(feats_unique)}
 
         # One vector space for all features. One vector is kept empty for padding.
-        self.vecs = nn.Embedding(max(self.feat2ii.values()) + 1, vec_size, padding_idx=0, sparse=False)
+        nb_vecs = max(self.feat2ii.values()) + 1
+        self.vecs = nn.Embedding(nb_vecs, vec_size, padding_idx=0, sparse=False).cuda()
         self.PADDING_VEC_I = self.vecs.padding_idx
 
         # Initialize vector space  w/ given distribution and parameters.
@@ -131,8 +134,8 @@ class IAFM(nn.Module):
             nb_inters.append(key2len[k0] * key2len[k1])
 
         # Convert to torch variables.
-        ii0_ch = Variable(torch.LongTensor(ii0))
-        ii1_ch = Variable(torch.LongTensor(ii1))
+        ii0_ch = Variable(torch.LongTensor(ii0)).cuda()
+        ii1_ch = Variable(torch.LongTensor(ii1)).cuda()
 
         # Retrieve as two batches of vectors.
         vv0_ch = self.vecs(ii0_ch)
@@ -145,10 +148,9 @@ class IAFM(nn.Module):
         # Sum each sample's interactions.
         sums_ch = muls_ch.sum(-1).sum(-1)
 
-        # Divide by the number of interactions in each sample.
-        nb_inters_ch = Variable(torch.FloatTensor(nb_inters), requires_grad=False)
+        # Divide by the number of interactions in each sample to get predicted target.
+        nb_inters_ch = Variable(torch.FloatTensor(nb_inters), requires_grad=False).cuda()
         pt_ch = sums_ch / nb_inters_ch
-        # pt_ch = sums_ch
         pt = self._sigmoid(pt_ch.cpu().data.numpy())
 
         # No true targets given, just return predicted targets.
@@ -156,7 +158,7 @@ class IAFM(nn.Module):
             return pt
 
         # Compute the loss and make a gradient update.
-        tt_ch = Variable(torch.FloatTensor(tt * 1.))
+        tt_ch = Variable(torch.FloatTensor(tt * 1.)).cuda()
         loss_ch = self.criterion(pt_ch, tt_ch)
         loss_ch.backward()
         self.optimizer.step()
@@ -379,6 +381,7 @@ class MultiVecRec(object):
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, **IAFM_kwargs)
+        iafm.cuda()
         key_pairs = samples[['user', 'song']].values
         targets = samples['target'].values
         iafm.fit(key_pairs, targets)
