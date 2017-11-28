@@ -36,11 +36,11 @@ IAFM_HYPERPARAMS_DEFAULT = {
     # https://discuss.pytorch.org/t/bug-of-nn-embedding-when-sparse-true-and-padding-idx-is-set/9382/2
 
     'optimizer_kwargs': {'lr': 0.01},
-    'vec_size': 25,
+    'vec_size': 10,
     'vec_init_func': np.random.normal,
     'vec_init_kwargs': {'loc': 0, 'scale': 0.01},
     'nb_epochs_max': 15,
-    'batch_size': 40000,
+    'batch_size': 50000,
     'early_stop_delta': 0.05,
     'early_stop_patience': 2,
 }
@@ -75,6 +75,7 @@ class IAFM(nn.Module):
         vec_init_kwargs.update({'size': tuple(self.vecs.weight.size())})
         vw = vec_init_func(**vec_init_kwargs)
         self.vecs.weight.data = torch.FloatTensor(vw.astype(np.float32))
+        self.vecs.weight.data[self.PADDING_VEC_I] *= 0
 
         # Training criteria.
         self.optimizer = optimizer(self.parameters(), **optimizer_kwargs)
@@ -201,6 +202,9 @@ def get_user_feats(df):
     msno2key = lambda x: 'u-%s' % x
     keys = df['msno'].apply(msno2key).values.tolist()
 
+    # Keep a lookup of the training msnos.
+    msno_trn = set(df.msno.values[:NTRN])
+
     # Remove duplicate based on Id.
     df = df.drop_duplicates('msno')
     keys_dedup = df['msno'].apply(msno2key).values.tolist()
@@ -212,8 +216,9 @@ def get_user_feats(df):
 
         key2feats[k] = []
 
-        # User msno (id).
-        key2feats[k].append(('u-msno', row['msno']))
+        # User msno (id). Missing if not in training set.
+        if row['msno'] in msno_trn:
+            key2feats[k].append(('u-msno', row['msno']))
 
         # User age. Clipped and rounded.
         if 0 < row['bd'] < 70:
@@ -268,6 +273,9 @@ def get_song_feats(df):
     print('%.4lf' % (time() - t0))
     pool.close()
 
+    # Keep a lookup of the training song ids.
+    song_ids_trn = set(df['song_id'].values[:NTRN])
+
     # Remove duplicates.
     df = df.drop_duplicates('song_id')
     keys_dedup = df['song_id'].apply(songid2key).values.tolist()
@@ -279,8 +287,9 @@ def get_song_feats(df):
 
         key2feats[k] = []
 
-        # Song id.
-        key2feats[k].append(('s-id', row['song_id']))
+        # Song id. Missing if not in training set.
+        if row['song_id'] in song_ids_trn:
+            key2feats[k].append(('s-id', row['song_id']))
 
         # Song length. Missing if nan.
         if not np.isnan(row['song_length']):
