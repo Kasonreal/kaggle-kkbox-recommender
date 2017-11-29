@@ -5,7 +5,7 @@ from multiprocessing import Pool, cpu_count
 from os.path import exists
 from os import getenv
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, ShuffleSplit
 from time import time
 from tqdm import tqdm
 import argparse
@@ -31,15 +31,16 @@ from keras.regularizers import l2
 from keras.callbacks import ModelCheckpoint, EarlyStopping
 import keras.backend as K
 
+# 7 epochs.
 IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 25,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
     'vecs_reg_func': l2,
-    'vecs_reg_kwargs': {'l': 0.0005},
+    'vecs_reg_kwargs': {'l': 0.0},
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'nb_epochs_max': 15,
+    'nb_epochs_max': 3,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
@@ -104,7 +105,8 @@ class IAFM(object):
         vecsw = self.vecs_init_func(**self.vecs_init_kwargs)
         vecsw[0] *= 0
         reg = self.vecs_reg_func(**self.vecs_reg_kwargs)
-        vecs = Embedding(self.nb_vecs, self.vec_size, weights=[vecsw], mask_zero=True, name='vecs')
+        vecs = Embedding(self.nb_vecs, self.vec_size, weights=[vecsw],
+                         mask_zero=True, name='vecs', embeddings_regularizer=reg)
 
         # Dot and adjust vectors.
         vecs_cat = concatenate([vecs(feat_vii_0), vecs(feat_vii_1)], axis=-1, name='vecs_cat')
@@ -167,11 +169,14 @@ class IAFM(object):
         ]
 
         net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc])
-        net.fit_generator(
-            epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1,
+        history = net.fit_generator(
+            epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1000,
             generator=gen_trn, steps_per_epoch=ceil(len(Xt) / self.batch_size),
             validation_data=gen_val, validation_steps=ceil(len(Xv) / self.batch_size)
         )
+
+        i = np.argmax(history.history['val_auc_roc'])
+        return history.history['val_loss'][i], history.history['val_auc_roc'][i]
 
     def predict(self, X):
         net = self.net()
@@ -402,6 +407,33 @@ class MultiVecRec(object):
             })
             keys_tst.to_csv(path_sample_keys_tst, index=False)
 
+            # Count occurrences of test features in training set.
+            with open(path_feats, 'rb') as fp:
+                feats = pickle.load(fp)
+            keys_trn = pd.read_csv(path_sample_keys_trn, usecols=['user', 'song'])
+            keys_tst = pd.read_csv(path_sample_keys_tst, usecols=['user', 'song'])
+            feats_trn = flatten(map(feats.get, flatten(keys_trn.values)))
+            feats_tst = flatten(map(feats.get, flatten(keys_tst.values)))
+            cntr_trn = Counter(feats_trn)
+            cntr_tst = Counter({k: cntr_trn[k] for k in set(feats_tst)})
+            cnts_trn = np.array(list(cntr_trn.values()))
+            cnts_tst = np.array(list(cntr_tst.values()))
+
+            self.logger.info('Training set most common features')
+            self.logger.info(cntr_trn.most_common()[:6])
+            self.logger.info('Test set most common features')
+            self.logger.info(cntr_tst.most_common()[:6])
+            self.logger.info('Training set feature counts:')
+            self.logger.info('mean = %.2lf' % cnts_trn.mean())
+            self.logger.info('median = %d' % np.median(cnts_trn))
+            self.logger.info('max = %d' % cnts_trn.max())
+            self.logger.info('min = %d' % cnts_trn.min())
+            self.logger.info('Test set feature counts (occurring in the training set):')
+            self.logger.info('mean = %.2lf' % cnts_tst.mean())
+            self.logger.info('median = %d' % np.median(cnts_tst))
+            self.logger.info('max = %d' % cnts_tst.max())
+            self.logger.info('min = %d' % cnts_tst.min())
+
         # Read from disk and return keys and features.
         self.logger.info('Reading features from disk')
         keys = pd.read_csv(path_sample_keys_trn) if train \
@@ -414,9 +446,29 @@ class MultiVecRec(object):
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
-        targets = samples['target'].values
-        data = train_test_split(X, targets, test_size=0.2, random_state=np.random)
-        iafm.fit(*data)
+        y = samples['target'].values
+        _, Xv, _, yv = train_test_split(X, y, test_size=0.2)
+        val_loss, val_auc = iafm.fit(X, Xv, y, yv)
+
+    def crossval(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        X = samples[['user', 'song']].values
+        y = samples['target'].values
+        losses, aucs = [], []
+        splitter = ShuffleSplit(n_splits=4, test_size=0.25)
+        s = 'Starting %d-fold cross-validation' % splitter.n_splits
+        self.logger.info('-' * len(s))
+        self.logger.info(s)
+        self.logger.info('-' * len(s))
+        for cvi, (ii_trn, ii_val) in enumerate(splitter.split(X, y)):
+            iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+            val_loss, val_auc = iafm.fit(X[ii_trn], X[ii_val], y[ii_trn], y[ii_val])
+            losses.append(val_loss)
+            aucs.append(val_auc)
+            s = '%d: mean loss = %.3lf, mean auc = %.3lf' % (cvi, np.mean(losses), np.mean(aucs))
+            self.logger.info('-' * len(s))
+            self.logger.info(s)
+            self.logger.info('-' * len(s))
+        return np.mean(losses), np.mean(aucs)
 
     def predict(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
@@ -432,7 +484,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description='')
     ap.add_argument('--fit', action='store_true', default=False)
     ap.add_argument('--predict', action='store_true', default=False)
-    ap.add_argument('--hpo', action='store_true', default=False)
+    ap.add_argument('--crossval', action='store_true', default=False)
     args = vars(ap.parse_args())
 
     model = MultiVecRec(
@@ -442,11 +494,13 @@ if __name__ == "__main__":
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
 
+    # model.get_features()
+
     if args['fit']:
         model.fit(*model.get_features(train=True))
 
     if args['predict']:
         model.predict(*model.get_features(test=True))
 
-    if args['hpo']:
-        model.hpo()
+    if args['crossval']:
+        model.crossval(*model.get_features(train=True))
