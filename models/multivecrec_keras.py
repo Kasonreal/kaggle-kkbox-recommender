@@ -28,42 +28,50 @@ from keras.models import Model, load_model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
 from keras.regularizers import l2
-from keras.callbacks import LambdaCallback
+from keras.callbacks import ModelCheckpoint, EarlyStopping
 import keras.backend as K
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 50,
+    'vec_size': 25,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
+    'vecs_reg_func': l2,
+    'vecs_reg_kwargs': {'l': 0.0005},
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'nb_epochs_max': 5,
+    'nb_epochs_max': 15,
     'batch_size': 50000,
-    'early_stop_metric': 'loss',
-    'early_stop_delta': 0.05,
+    'early_stop_metric': 'val_auc_roc',
+    'early_stop_delta': 0.005,
     'early_stop_patience': 2,
 }
 
 
 class IAFM(object):
 
-    def __init__(self, key2feats, vec_size, vecs_init_func, vecs_init_kwargs,
-                 optimizer, optimizer_kwargs, nb_epochs_max, batch_size,
-                 early_stop_metric, early_stop_delta, early_stop_patience):
+    def __init__(self, key2feats, best_model_path, vec_size, vecs_init_func,
+                 vecs_init_kwargs, vecs_reg_func, vecs_reg_kwargs, optimizer,
+                 optimizer_kwargs, nb_epochs_max, batch_size, early_stop_metric,
+                 early_stop_delta, early_stop_patience,):
 
         self.key2feats = key2feats
+        self.best_model_path = best_model_path
         self.vec_size = vec_size
         self.vecs_init_func = vecs_init_func
         self.vecs_init_kwargs = vecs_init_kwargs
+        self.vecs_reg_func = vecs_reg_func
+        self.vecs_reg_kwargs = vecs_reg_kwargs
         self.optimizer = optimizer
         self.optimizer_kwargs = optimizer_kwargs
         self.nb_epochs_max = nb_epochs_max
         self.batch_size = batch_size
+        self.early_stop_metric = early_stop_metric
         self.early_stop_delta = early_stop_delta
         self.early_stop_patience = early_stop_patience
 
         # Compute all of the unique feature keys.
         feats_unique = set(flatten(self.key2feats.values()))
+        feats_unique = sorted(feats_unique, key=str)
 
         # Map feature -> vector index. Add 1 to account for padding index.
         self.feat2vii = {f: i + 1 for i, f in enumerate(feats_unique)}
@@ -95,6 +103,7 @@ class IAFM(object):
         self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
         vecsw = self.vecs_init_func(**self.vecs_init_kwargs)
         vecsw[0] *= 0
+        reg = self.vecs_reg_func(**self.vecs_reg_kwargs)
         vecs = Embedding(self.nb_vecs, self.vec_size, weights=[vecsw], mask_zero=True, name='vecs')
 
         # Dot and adjust vectors.
@@ -113,15 +122,20 @@ class IAFM(object):
 
         return net
 
-    def gen(self, X, y):
+    def gen(self, X, y, shuffle):
         bii = np.arange(len(X))
         while True:
-            np.random.shuffle(bii)
+            if shuffle:
+                np.random.shuffle(bii)
             for bii_ in chunked(bii, self.batch_size):
                 X_0, X_1, X_2 = [], [], []
                 for i, (k0, k1) in enumerate(X[bii_]):
                     X_0.append(self.key2vii[k0])
                     X_1.append(self.key2vii[k1])
+
+                    if self.key2len[k0] * self.key2len[k1] == 0:
+                        pdb.set_trace()
+
                     X_2.append(1. / (self.key2len[k0] * self.key2len[k1]))
                 X_0 = np.array(X_0)
                 X_1 = np.array(X_1)
@@ -130,10 +144,9 @@ class IAFM(object):
 
     def fit(self, Xt, Xv, yt, yv):
 
-        def auc_roc(y_true, y_pred):
+        def auc_roc(yt, yp):
             """https://github.com/fchollet/keras/issues/6050"""
-            # value, update_op = tf.contrib.metrics.streaming_auc(y_pred, y_true)
-            value, update_op = tf.metrics.auc(y_pred, y_true)
+            value, update_op = tf.contrib.metrics.streaming_auc(yp, yt)
             metric_vars = [i for i in tf.local_variables() if 'auc_roc' in i.name.split('/')[1]]
             for v in metric_vars:
                 tf.add_to_collection(tf.GraphKeys.GLOBAL_VARIABLES, v)
@@ -143,26 +156,40 @@ class IAFM(object):
 
         net = self.net()
         opt = self.optimizer(**self.optimizer_kwargs)
-        gt = self.gen(Xt, yt)
-        gv = self.gen(Xv, yv)
+        gen_trn = self.gen(Xt, yt, shuffle=True)
+        gen_val = self.gen(Xv, yv, shuffle=True)
 
-        cb = []
+        cb = [
+            ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
+                            save_best_only=True, save_weights_only=True, mode='max'),
+            EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
+                          patience=self.early_stop_patience, verbose=1, mode='max')
+        ]
 
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[])
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc])
         net.fit_generator(
             epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1,
-            generator=gt, steps_per_epoch=ceil(len(Xt) / self.batch_size),
-            validation_data=gv, validation_steps=ceil(len(Xv) / self.batch_size)
+            generator=gen_trn, steps_per_epoch=ceil(len(Xt) / self.batch_size),
+            validation_data=gen_val, validation_steps=ceil(len(Xv) / self.batch_size)
         )
 
-        pdb.set_trace()
+    def predict(self, X):
+        net = self.net()
+        net.load_weights(self.best_model_path, by_name=True)
+        gen = self.gen(X, y=np.zeros(len(X)), shuffle=False)
+        yp = []
+        for _ in tqdm(range(0, len(X), self.batch_size)):
+            X_, _ = next(gen)
+            yp_ = net.predict(X_, batch_size=self.batch_size)
+            yp += yp_[:, 0].tolist()
+        return yp
 
 
 def round_to(n, r):
     return round(n / r) * r
 
 
-def get_user_feats(df):
+def get_user_feats(df, logger):
     """For each user, create a mapping from a unique user key to
     a list of [feature type, feature value] pairs."""
 
@@ -206,6 +233,8 @@ def get_user_feats(df):
         y0 = int(str(row['registration_init_time'])[:4])
         key2feats[k].append(('u-reg-year', y0))
 
+        assert len(key2feats[k]) > 0, 'No features found for %s' % k
+
     return keys, key2feats
 
 
@@ -219,7 +248,7 @@ def split_multi(maybe_vals):
     return []
 
 
-def get_song_feats(df):
+def get_song_feats(df, logger):
 
     # Key is the song id prefixed by "s-"
     songid2key = lambda x: 's-%s' % x
@@ -234,11 +263,11 @@ def get_song_feats(df):
                                  df['lyricist'].values.tolist() +
                                  df['composer'].values.tolist()))
     musician_counts = Counter(musicians)
-    print('%.4lf' % (time() - t0))
+    logger.info('Counted musicians in %d seconds' % (time() - t0))
 
     genre_ids = flatten(pool.map(split_multi, df['genre_ids'].values.tolist()))
     genre_id_counts = Counter(genre_ids)
-    print('%.4lf' % (time() - t0))
+    logger.info('Counted genres in %d seconds' % (time() - t0))
     pool.close()
 
     # Keep a lookup of the training song ids.
@@ -254,6 +283,10 @@ def get_song_feats(df):
     for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
         key2feats[k] = []
+
+        # Ad-hoc replacements.
+        if row['song_id'] == 'GQK/aYFW8elL+4o7Qo1zNSQmjYDKJfacYT2+QKWQ71U=':
+            row['isrc'] = 'ESAAI0205357'
 
         # Song id. Missing if not in training set.
         if row['song_id'] in song_ids_trn:
@@ -290,6 +323,8 @@ def get_song_feats(df):
             mmc = map(musician_counts.get, mm)
             key2feats[k].append(('s-musician', mm[np.argmax(mmc)]))
 
+        assert len(key2feats[k]) > 0, 'No features found for %s' % k
+
     return keys, key2feats
 
 
@@ -325,26 +360,25 @@ class MultiVecRec(object):
             TRN = pd.read_csv('%s/train.csv' % self.data_dir)
             TST = pd.read_csv('%s/test.csv' % self.data_dir)
 
-            self.logger.info('Merge SNG and SEI.')
-            SNG = SNG.merge(SEI, on='song_id', how='left')
-
-            self.logger.info('Merge TRN and TST with SNG and MMB.')
+            self.logger.info('Merge TRN, TST with SNG, SEI, MMB.')
             TRN = TRN.merge(MMB, on='msno', how='left')
             TST = TST.merge(MMB, on='msno', how='left')
             TRN = TRN.merge(SNG, on='song_id', how='left')
             TST = TST.merge(SNG, on='song_id', how='left')
+            TRN = TRN.merge(SEI, on='song_id', how='left')
+            TST = TST.merge(SEI, on='song_id', how='left')
 
             self.logger.info('Combining TRN and TST')
             CMB = TRN.append(TST)
 
             # Throw away unused after merging.
-            del SEI, MMB
-
-            self.logger.info('Encoding song features')
-            skeys, skey2feats = get_song_feats(CMB)
+            del SNG, SEI, MMB
 
             self.logger.info('Encoding user features')
-            ukeys, ukey2feats = get_user_feats(CMB)
+            ukeys, ukey2feats = get_user_feats(CMB, self.logger)
+
+            self.logger.info('Encoding song features')
+            skeys, skey2feats = get_song_feats(CMB, self.logger)
 
             self.logger.info('Saving features')
             with open(path_feats, 'wb') as fp:
@@ -378,11 +412,19 @@ class MultiVecRec(object):
         return keys, feats
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
-        iafm = IAFM(key2feats, **IAFM_kwargs)
+        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         targets = samples['target'].values
-        data = train_test_split(X, targets, test_size=0.5, random_state=np.random)
+        data = train_test_split(X, targets, test_size=0.2, random_state=np.random)
         iafm.fit(*data)
+
+    def predict(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+        yp = iafm.predict(samples[['user', 'song']].values)
+        self.logger.info('yp mean=%.3lf' % (np.mean(yp)))
+        df = pd.DataFrame({'id': samples['id'], 'target': yp})
+        df.to_csv(self.predict_path, index=False)
+        self.logger.info('Saved %s' % self.predict_path)
 
 if __name__ == "__main__":
 
@@ -396,7 +438,7 @@ if __name__ == "__main__":
     model = MultiVecRec(
         data_dir='data',
         artifacts_dir='artifacts/multivecrec',
-        best_model_path='artifacts/multivecrec/model.hdf5',
+        best_model_path='artifacts/multivecrec/model-iafm-best.hdf5',
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
 
@@ -404,7 +446,7 @@ if __name__ == "__main__":
         model.fit(*model.get_features(train=True))
 
     if args['predict']:
-        model.predict()
+        model.predict(*model.get_features(test=True))
 
     if args['hpo']:
         model.hpo()
