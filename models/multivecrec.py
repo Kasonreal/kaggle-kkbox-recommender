@@ -4,6 +4,7 @@ from more_itertools import flatten, chunked
 from multiprocessing import Pool, cpu_count
 from os.path import exists
 from os import getenv
+from pprint import pformat
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split, ShuffleSplit
 from time import time
@@ -31,7 +32,6 @@ from keras.regularizers import l2
 from keras.callbacks import ModelCheckpoint, EarlyStopping
 import keras.backend as K
 
-# 7 epochs.
 IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 25,
     'vecs_init_func': np.random.normal,
@@ -40,11 +40,12 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vecs_reg_kwargs': {'l': 0.0},
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
+    'dropout_prop': 0.3,
     'nb_epochs_max': 2,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
-    'early_stop_patience': 2,
+    'early_stop_patience': 2
 }
 
 
@@ -52,8 +53,8 @@ class IAFM(object):
 
     def __init__(self, key2feats, best_model_path, vec_size, vecs_init_func,
                  vecs_init_kwargs, vecs_reg_func, vecs_reg_kwargs, optimizer,
-                 optimizer_kwargs, nb_epochs_max, batch_size, early_stop_metric,
-                 early_stop_delta, early_stop_patience,):
+                 optimizer_kwargs, dropout_prop, nb_epochs_max, batch_size,
+                 early_stop_metric, early_stop_delta, early_stop_patience):
 
         self.key2feats = key2feats
         self.best_model_path = best_model_path
@@ -64,6 +65,7 @@ class IAFM(object):
         self.vecs_reg_kwargs = vecs_reg_kwargs
         self.optimizer = optimizer
         self.optimizer_kwargs = optimizer_kwargs
+        self.dropout_prop = dropout_prop
         self.nb_epochs_max = nb_epochs_max
         self.batch_size = batch_size
         self.early_stop_metric = early_stop_metric
@@ -124,24 +126,37 @@ class IAFM(object):
 
         return net
 
-    def gen(self, X, y, shuffle):
+    def gen(self, X, y, shuffle, dropout_prop):
         bii = np.arange(len(X))
         while True:
+
             if shuffle:
                 np.random.shuffle(bii)
+
             for bii_ in chunked(bii, self.batch_size):
-                X_0, X_1, X_2 = [], [], []
+
+                # Populate inputs. Appending to list is faster than setting values in array.
+                X_0 = []  # Vector indexes for first interaction keys.
+                X_1 = []  # Vector indexes for second interaction keys.
                 for i, (k0, k1) in enumerate(X[bii_]):
                     X_0.append(self.key2vii[k0])
                     X_1.append(self.key2vii[k1])
 
-                    if self.key2len[k0] * self.key2len[k1] == 0:
-                        pdb.set_trace()
-
-                    X_2.append(1. / (self.key2len[k0] * self.key2len[k1]))
+                # Convert lists to arrays. Still faster than setting values directly.
                 X_0 = np.array(X_0)
                 X_1 = np.array(X_1)
-                X_2 = np.array(X_2)
+
+                # Apply dropout. Ensure X_2 remains lower-bounded at 1.
+                if dropout_prop > 0:
+                    dropout_mask = np.random.binomial(1, 1. - dropout_prop, X_0.shape)
+                    X_0 *= dropout_mask
+                    X_1 *= dropout_mask
+
+                # Number of active interactions between each pair of keys.
+                X_2 = 1. / (np.sum(X_0 > 0, 1) * np.sum(X_1 > 0, 1) + 1e-7)
+                assert np.min(X_2) > 0
+
+                # Concatenate inputs and target.
                 yield [X_0, X_1, X_2], y[bii_]
 
     def fit(self, Xt, Xv, yt, yv):
@@ -158,8 +173,8 @@ class IAFM(object):
 
         net = self.net()
         opt = self.optimizer(**self.optimizer_kwargs)
-        gen_trn = self.gen(Xt, yt, shuffle=True)
-        gen_val = self.gen(Xv, yv, shuffle=True)
+        gen_trn = self.gen(Xt, yt, shuffle=True, dropout_prop=self.dropout_prop)
+        gen_val = self.gen(Xv, yv, shuffle=True, dropout_prop=0.)
 
         cb = [
             ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
@@ -181,7 +196,7 @@ class IAFM(object):
     def predict(self, X):
         net = self.net()
         net.load_weights(self.best_model_path, by_name=True)
-        gen = self.gen(X, y=np.zeros(len(X)), shuffle=False)
+        gen = self.gen(X, y=np.zeros(len(X)), shuffle=False, dropout_prop=0)
         yp = []
         for _ in tqdm(range(0, len(X), self.batch_size)):
             X_, _ = next(gen)
@@ -450,7 +465,15 @@ class MultiVecRec(object):
         _, Xv, _, yv = train_test_split(X, y, test_size=0.2)
         val_loss, val_auc = iafm.fit(X, Xv, y, yv)
 
+    # def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+    #     iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+    #     X = samples[['user', 'song']].values
+    #     y = samples['target'].values
+    #     Xt, Xv, yt, yv = train_test_split(X, y, shuffle=False, test_size=0.2)
+    #     val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
+
     def crossval(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        self.logger.info(pformat(IAFM_kwargs))
         X = samples[['user', 'song']].values
         y = samples['target'].values
         losses, aucs = [], []
