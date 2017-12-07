@@ -26,16 +26,17 @@ np.random.seed(865)
 assert getenv('CUDA_VISIBLE_DEVICES') is not None, "Specify a GPU"
 assert len(getenv('CUDA_VISIBLE_DEVICES')) > 0, "Specify a GPU"
 
-from keras.layers import Input, Embedding, Activation, Lambda, concatenate, multiply
+from keras.engine.topology import Layer
+from keras.layers import Input, Embedding, Activation, Lambda, concatenate, multiply, dot
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam
 from keras.regularizers import l2
-from keras.callbacks import ModelCheckpoint, EarlyStopping
+from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback
 import keras.backend as K
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 25,
+    'vec_size': 10,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
     'vecs_reg_func': l2,
@@ -43,12 +44,74 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'dropout_prop': 0.0,
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'nb_epochs_max': 4,
+    'nb_epochs_max': 5,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
     'early_stop_patience': 2,
 }
+
+
+class VecReviewCallback(Callback):
+
+    def __init__(self, vi2feat, nb_samples=6):
+        self.vi2feat = vi2feat
+        self.nb_samples = nb_samples
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def on_epoch_end(self, epoch, logs):
+        print('\n')
+
+        # Extract the vectors.
+        vecs = self.model.get_layer('vecs').get_weights()[0]
+
+        # Make sure the padding vector has not been changed.
+        assert np.all(vecs[0] == np.zeros_like(vecs[0])), 'Vector 0 must be all-zero'
+
+        # Compute and sort vector norms. Print those with highest and lowest norm.
+        norms = np.sqrt(np.sum(vecs ** 2, 1))
+        norms_vi = np.argsort(norms)
+        for i in reversed(norms_vi[-self.nb_samples:]):
+            self.logger.info('%-60s %.3lf' % (self.vi2feat[i].strip(), norms[i]))
+        self.logger.info('...')
+        for i in reversed(norms_vi[:self.nb_samples]):
+            self.logger.info('%-60s %.3lf' % (self.vi2feat[i].strip(), norms[i]))
+
+
+class FeatureVectorInteractions(Layer):
+    """"""
+
+    def __init__(self, **kwargs):
+        super(FeatureVectorInteractions, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        pass
+
+    def call(self, inputs):
+        VI0, VI1, V0, V1 = inputs
+
+        # Multiply the feature matrices to get *b* matrices of pair-wise feature products.
+        P = K.batch_dot(V0, K.permute_dimensions(V1, (0, 2, 1)), (2, 1))
+
+        # Each of the VI0 and VI1 has a number of zero entries which should be
+        # masked out. Compute row and column masks identifying non-zero entries.
+        # Row mask must be permuted to represent rows instead of cols.
+        row_mask = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
+        row_mask = K.permute_dimensions(row_mask, (0, 2, 1))
+        col_mask = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
+
+        # Combine the row and col masks into combined via elem-wise multiply.
+        cmb_mask = row_mask * col_mask
+
+        # Apply the combined mask to the product matrices via elem-wise multiply.
+        P = P * cmb_mask
+
+        # Return the sum of each matrix. This leaves a single scalar for each
+        # pair of feature matrices, representing their sum of interactions.
+        return K.expand_dims(K.sum(P, (1, 2)))
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0][0], 1)
 
 
 class IAFM(object):
@@ -73,20 +136,24 @@ class IAFM(object):
         self.early_stop_metric = early_stop_metric
         self.early_stop_delta = early_stop_delta
         self.early_stop_patience = early_stop_patience
+        self.logger = logging.getLogger(self.__class__.__name__)
 
+        self.logger.info('Preprocessing features')
         # Compute all of the unique feature keys.
         # Sort them to ensure reproducibility (as long as no new features are added).
         feats_unique = set(flatten(self.key2feats.values()))
         feats_unique = sorted(feats_unique, key=str)
 
-        # Map feature string -> vector index. Add 1 to account for padding index.
-        self.feat2vi = {f: i + 1 for i, f in enumerate(feats_unique)}
+        # Map feature string -> vector index and vice-versa. Add 1 for padding index.
+        self.feat2vi = {f: i for i, f in enumerate(['padding'] + feats_unique)}
+        self.vi2feat = {i: f for f, i in self.feat2vi.items()}
 
         # Number of vectors required. One per feature plus padding vector.
         self.nb_vecs = len(self.feat2vi) + 1
 
         # Max number of feature indexes.
         self.nb_vi_max = max(map(len, self.key2feats.values()))
+        self.logger.info('Vector space dimensions: (%dx%d)' % (self.nb_vecs, self.nb_vi_max))
 
         # Populate the VI matrix. Each row contains vector indexes for single key.
         # Also need a mapping from key -> vector indexes for that key.
@@ -99,31 +166,27 @@ class IAFM(object):
     def net(self):
 
         # Three inputs: user vector indexes, song vector indexes.
-        feat_vii_0 = Input((self.nb_vi_max,), name='feat_vii_0')
-        feat_vii_1 = Input((self.nb_vi_max,), name='feat_vii_1')
+        VI0 = Input((self.nb_vi_max,), name='VI0')
+        VI1 = Input((self.nb_vi_max,), name='VI1')
 
-        # Build and initialize single vector space. Set vector 0 to all 0s.
-        self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
-        vecsw = self.vecs_init_func(**self.vecs_init_kwargs)
-        vecsw[0] *= 0
+        # Setup vector space regularization
         reg = self.vecs_reg_func(**self.vecs_reg_kwargs)
-        vecs = Embedding(self.nb_vecs, self.vec_size, weights=[vecsw],
-                         mask_zero=True, name='vecs', embeddings_regularizer=reg)
 
-        # Dot and adjust vectors.
-        vecs_cat = concatenate([vecs(feat_vii_0), vecs(feat_vii_1)], axis=-1, name='vecs_cat')
-        b = lambda v0, v1: K.batch_dot(v0, v1, axes=(2, 1))
-        t = lambda v: K.permute_dimensions(v, (0, 2, 1))
-        vecs_mul = Lambda(lambda x: b(x[:, :, :self.vec_size], t(x[:, :, self.vec_size:])), name='vecs_mul')(vecs_cat)
-        vecs_sum = Lambda(lambda x: K.sum(x, (1, 2)), name='vecs_sum')(vecs_mul)
-        vecs_dim = Lambda(K.expand_dims)(vecs_sum)
-        classify = Activation('sigmoid')(vecs_dim)
+        # Initialize vector space weights. Vector 0 is all 0s.
+        self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
+        W = self.vecs_init_func(**self.vecs_init_kwargs)
+        W[0] *= 0
 
-        net = Model([feat_vii_0, feat_vii_1], classify)
+        # Build and initialize single vector space.
+        V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W],
+                      embeddings_regularizer=reg)
 
-        # Ensure padding vector is all zeros.
-        assert set(net.get_layer('vecs').get_weights()[0][0]) == {0}
-        return net
+        # Compute feature vector interactions. Return *batch* scalars.
+        I = FeatureVectorInteractions(name='fvi')([VI0, VI1, V(VI0), V(VI1)])
+
+        # Apply sigmoid for classification and return network.
+        classify = Activation('sigmoid')(I)
+        return Model([VI0, VI1], classify)
 
     def gen(self, X, y, shuffle, dropout_prop):
         bii = np.arange(len(X))
@@ -147,20 +210,28 @@ class IAFM(object):
                 value = tf.identity(value)
                 return value
 
+        def avg_pos(yt, yp):
+            return K.sum(yp * yt) / K.sum(yt)
+
+        def avg_neg(yt, yp):
+            return K.sum(yp * (1 - yt)) / K.sum(1 - yt)
+
         net = self.net()
         net.summary()
+
         opt = self.optimizer(**self.optimizer_kwargs)
         gen_trn = self.gen(Xt, yt, shuffle=True, dropout_prop=self.dropout_prop)
         gen_val = self.gen(Xv, yv, shuffle=True, dropout_prop=0.)
 
         cb = [
+            VecReviewCallback(self.vi2feat),
             ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
                             save_best_only=True, save_weights_only=True, mode='max'),
             EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
-                          patience=self.early_stop_patience, verbose=1, mode='max')
+                          patience=self.early_stop_patience, verbose=1, mode='max'),
         ]
 
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc])
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc, avg_pos, avg_neg])
         history = net.fit_generator(
             epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1000,
             generator=gen_trn, steps_per_epoch=ceil(len(Xt) / self.batch_size),
@@ -290,7 +361,7 @@ def get_song_feats(df, logger):
         # Song hash. There are ~9K song records that have distinct song_ids
         # but otherwise identical properties. Use the hash of these properties
         # instead of the song_id as a unique identifier.
-        song_hash = md5(row[hash_cols].values.tobytes()).hexdigest()
+        song_hash = md5(str(row[hash_cols].values).encode()).hexdigest()
         key2feats[k].append('s-hash-%s' % song_hash)
 
         # Song length. Missing if nan. Log transformed.
@@ -422,7 +493,7 @@ class MultiVecRec(object):
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        _, Xv, _, yv = train_test_split(X, y, test_size=0.1, shuffle=False)
+        _, Xv, _, yv = train_test_split(X, y, test_size=0.05, shuffle=False)
         val_loss, val_auc = iafm.fit(X, Xv, y, yv)
 
     def val(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
