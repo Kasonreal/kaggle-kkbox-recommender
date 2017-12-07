@@ -1,4 +1,5 @@
 from collections import Counter
+from hashlib import md5
 from math import log, ceil
 from more_itertools import flatten, chunked
 from multiprocessing import Pool, cpu_count
@@ -10,11 +11,12 @@ from sklearn.model_selection import train_test_split, ShuffleSplit
 from time import time
 from tqdm import tqdm
 import argparse
+import json
 import logging
 import numpy as np
 import pandas as pd
-import pickle
 import pdb
+import re
 import tensorflow as tf
 
 NTRN = 7377418
@@ -38,14 +40,14 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
     'vecs_reg_func': l2,
     'vecs_reg_kwargs': {'l': 0.0},
+    'dropout_prop': 0.0,
     'optimizer': Adam,
     'optimizer_kwargs': {'lr': 0.01},
-    'dropout_prop': 0.3,
-    'nb_epochs_max': 2,
+    'nb_epochs_max': 4,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
-    'early_stop_patience': 2
+    'early_stop_patience': 2,
 }
 
 
@@ -73,34 +75,32 @@ class IAFM(object):
         self.early_stop_patience = early_stop_patience
 
         # Compute all of the unique feature keys.
+        # Sort them to ensure reproducibility (as long as no new features are added).
         feats_unique = set(flatten(self.key2feats.values()))
         feats_unique = sorted(feats_unique, key=str)
 
-        # Map feature -> vector index. Add 1 to account for padding index.
-        self.feat2vii = {f: i + 1 for i, f in enumerate(feats_unique)}
+        # Map feature string -> vector index. Add 1 to account for padding index.
+        self.feat2vi = {f: i + 1 for i, f in enumerate(feats_unique)}
 
         # Number of vectors required. One per feature plus padding vector.
-        self.nb_vecs = max(self.feat2vii.values()) + 1
+        self.nb_vecs = len(self.feat2vi) + 1
 
         # Max number of feature indexes.
-        self.nb_vii_max = max(map(len, self.key2feats.values()))
+        self.nb_vi_max = max(map(len, self.key2feats.values()))
 
-        # Map key -> [padded list of the indexes]. 0 used for padding.
-        # Map key -> number of non-padded indexes in index list
-        self.key2vii = {}
-        self.key2len = {}
-        for k, v in self.key2feats.items():
-            padding = [0] * (self.nb_vii_max - len(v))
-            self.key2vii[k] = [self.feat2vii[f] for f in v] + padding
-            self.key2len[k] = len(v)
-        assert set(map(len, self.key2vii.values())) == {self.nb_vii_max}
+        # Populate the VI matrix. Each row contains vector indexes for single key.
+        # Also need a mapping from key -> vector indexes for that key.
+        self.VI = np.zeros((self.nb_vecs, self.nb_vi_max), dtype=np.uint32)
+        self.key2VI_idx = {}
+        for i, (key, feats) in enumerate(self.key2feats.items()):
+            self.VI[i, :len(feats)] = [self.feat2vi[f] for f in feats]
+            self.key2VI_idx[key] = i
 
     def net(self):
 
-        # Three inputs: vector indexes, vector indexes, interaction coefficients.
-        feat_vii_0 = Input((self.nb_vii_max,), name='feat_vii_0')
-        feat_vii_1 = Input((self.nb_vii_max,), name='feat_vii_1')
-        inter_coefs = Input((1,), name='inter_coefs')
+        # Three inputs: user vector indexes, song vector indexes.
+        feat_vii_0 = Input((self.nb_vi_max,), name='feat_vii_0')
+        feat_vii_1 = Input((self.nb_vi_max,), name='feat_vii_1')
 
         # Build and initialize single vector space. Set vector 0 to all 0s.
         self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
@@ -116,48 +116,24 @@ class IAFM(object):
         t = lambda v: K.permute_dimensions(v, (0, 2, 1))
         vecs_mul = Lambda(lambda x: b(x[:, :, :self.vec_size], t(x[:, :, self.vec_size:])), name='vecs_mul')(vecs_cat)
         vecs_sum = Lambda(lambda x: K.sum(x, (1, 2)), name='vecs_sum')(vecs_mul)
-        vecs_adj = multiply([vecs_sum, inter_coefs], name='vecs_adj')
-        classify = Activation('sigmoid')(vecs_adj)
+        vecs_dim = Lambda(K.expand_dims)(vecs_sum)
+        classify = Activation('sigmoid')(vecs_dim)
 
-        net = Model([feat_vii_0, feat_vii_1, inter_coefs], classify)
+        net = Model([feat_vii_0, feat_vii_1], classify)
 
         # Ensure padding vector is all zeros.
         assert set(net.get_layer('vecs').get_weights()[0][0]) == {0}
-
         return net
 
     def gen(self, X, y, shuffle, dropout_prop):
         bii = np.arange(len(X))
         while True:
-
             if shuffle:
                 np.random.shuffle(bii)
-
             for bii_ in chunked(bii, self.batch_size):
-
-                # Populate inputs. Appending to list is faster than setting values in array.
-                X_0 = []  # Vector indexes for first interaction keys.
-                X_1 = []  # Vector indexes for second interaction keys.
-                for i, (k0, k1) in enumerate(X[bii_]):
-                    X_0.append(self.key2vii[k0])
-                    X_1.append(self.key2vii[k1])
-
-                # Convert lists to arrays. Still faster than setting values directly.
-                X_0 = np.array(X_0)
-                X_1 = np.array(X_1)
-
-                # Apply dropout. Ensure X_2 remains lower-bounded at 1.
-                if dropout_prop > 0:
-                    dropout_mask = np.random.binomial(1, 1. - dropout_prop, X_0.shape)
-                    X_0 *= dropout_mask
-                    X_1 *= dropout_mask
-
-                # Number of active interactions between each pair of keys.
-                X_2 = 1. / (np.sum(X_0 > 0, 1) * np.sum(X_1 > 0, 1) + 1e-7)
-                assert np.min(X_2) > 0
-
-                # Concatenate inputs and target.
-                yield [X_0, X_1, X_2], y[bii_]
+                ii0 = [self.key2VI_idx[k] for k in X[bii_, 0]]
+                ii1 = [self.key2VI_idx[k] for k in X[bii_, 1]]
+                yield [self.VI[ii0], self.VI[ii1]], y[bii_]
 
     def fit(self, Xt, Xv, yt, yv):
 
@@ -172,6 +148,7 @@ class IAFM(object):
                 return value
 
         net = self.net()
+        net.summary()
         opt = self.optimizer(**self.optimizer_kwargs)
         gen_trn = self.gen(Xt, yt, shuffle=True, dropout_prop=self.dropout_prop)
         gen_val = self.gen(Xv, yv, shuffle=True, dropout_prop=0.)
@@ -233,72 +210,74 @@ def get_user_feats(df, logger):
 
         # User msno (id). Missing if not in training set.
         if row['msno'] in msno_trn:
-            key2feats[k].append(('u-msno', row['msno']))
+            key2feats[k].append('u-msno-%s' % row['msno'])
 
         # User age. Clipped and rounded.
         if 0 < row['bd'] < 70:
-            key2feats[k].append(('u-age', round_to(row['bd'], 5)))
+            key2feats[k].append('u-age-%d' % round_to(row['bd'], 5))
 
         # User city. No missing values.
-        key2feats[k].append(('u-city', int(row['city'])))
+        key2feats[k].append('u-city-%d' % int(row['city']))
 
         # User gender. Missing if not female or male.
         if row['gender'] in {'male', 'female'}:
-            key2feats[k].append(('u-sex', row['gender']))
+            key2feats[k].append('u-sex-%s' % row['gender'])
 
         # User registration method. No missing values.
-        key2feats[k].append(('u-reg-via', int(row['registered_via'])))
+        key2feats[k].append('u-reg-via-%d' % int(row['registered_via']))
 
         # User registration year. No missing values.
         y0 = int(str(row['registration_init_time'])[:4])
-        key2feats[k].append(('u-reg-year', y0))
+        key2feats[k].append('u-reg-year-%d' % y0)
 
         assert len(key2feats[k]) > 0, 'No features found for %s' % k
 
     return keys, key2feats
 
 
-def split_multi(maybe_vals):
-    if type(maybe_vals) == str:
-        split = maybe_vals.split('|')
-        try:
-            return [int(x) for x in split]
-        except ValueError as ex:
-            return [x.strip() for x in split]
-    return []
-
-
 def get_song_feats(df, logger):
 
     # Key is the song id prefixed by "s-"
+    # Need to get all of the keys first, including duplicates.
     songid2key = lambda x: 's-%s' % x
     keys = df['song_id'].apply(songid2key).values.tolist()
 
-    # Count the instances of each musician and genre.
-    # Musicians encompass artist, composer, and lyricist.
-    t0 = time()
-    pool = Pool(cpu_count())
-    musicians = flatten(pool.map(split_multi,
-                                 df['artist_name'].values.tolist() +
-                                 df['lyricist'].values.tolist() +
-                                 df['composer'].values.tolist()))
-    musician_counts = Counter(musicians)
-    logger.info('Counted musicians in %d seconds' % (time() - t0))
-
-    genre_ids = flatten(pool.map(split_multi, df['genre_ids'].values.tolist()))
-    genre_id_counts = Counter(genre_ids)
-    logger.info('Counted genres in %d seconds' % (time() - t0))
-    pool.close()
-
-    # Keep a lookup of the training song ids.
-    song_ids_trn = set(df['song_id'].values[:NTRN])
-
-    # Remove duplicates.
-    df = df.drop_duplicates('song_id')
+    # Keep only the song-related columns and remove duplicates based on song_id.
+    cols = ['song_id', 'song_length', 'name', 'language', 'isrc', 'genre_ids', 'artist_name', 'composer', 'lyricist']
+    hash_cols = cols[1:]
+    df = df[cols].drop_duplicates('song_id')
     keys_dedup = df['song_id'].apply(songid2key).values.tolist()
+
+    # Replace unknown artists, lyricists, composers. '佚名' means missing names.
+    # https://www.kaggle.com/c/kkbox-music-recommendation-challenge/discussion/43645
+    df['artist_name'].replace('佚名', np.nan, inplace=True)
+    df['lyricist'].replace('佚名', np.nan, inplace=True)
+    df['composer'].replace('佚名', np.nan, inplace=True)
+
+    # Replace languages. 3,10,24,59 represent Chinese.
+    # https://www.kaggle.com/c/kkbox-music-recommendation-challenge/discussion/43645
+    df['language'].replace(10, 3, inplace=True)
+    df['language'].replace(24, 3, inplace=True)
+    df['language'].replace(59, 3, inplace=True)
 
     # Build mapping from unique keys to features.
     key2feats = {}
+
+    # Regular expressions and function for parsing musicians.
+    RE_MUSICIANS_SPLIT_PATTERN = re.compile(r'feat(.)\w*|\(|\)|\|')
+
+    def parse_musicians(mstr):
+        r = []
+        if type(mstr) is str:
+            mstr = mstr.lower().replace('\n', ' ')
+            s = re.sub(RE_MUSICIANS_SPLIT_PATTERN, ',', mstr).split(',')
+            for t in s:
+                t = t.strip()
+                if len(t) > 0:
+                    r.append('s-musician-%s' % t)
+        return r
+
+    all_musicians = set()
 
     for k, (i, row) in tqdm(zip(keys_dedup, df.iterrows())):
 
@@ -308,40 +287,37 @@ def get_song_feats(df, logger):
         if row['song_id'] == 'GQK/aYFW8elL+4o7Qo1zNSQmjYDKJfacYT2+QKWQ71U=':
             row['isrc'] = 'ESAAI0205357'
 
-        # Song id. Missing if not in training set.
-        if row['song_id'] in song_ids_trn:
-            key2feats[k].append(('s-id', row['song_id']))
+        # Song hash. There are ~9K song records that have distinct song_ids
+        # but otherwise identical properties. Use the hash of these properties
+        # instead of the song_id as a unique identifier.
+        song_hash = md5(row[hash_cols].values.tobytes()).hexdigest()
+        key2feats[k].append('s-hash-%s' % song_hash)
 
-        # Song length. Missing if nan.
+        # Song length. Missing if nan. Log transformed.
         if not np.isnan(row['song_length']):
-            f = row['song_length'] / 1000 / 60
-            f = round(log(max(1, f)))
-            key2feats[k].append(('s-len', f))
+            f = round(log(1 + row['song_length'] / 1000 / 60))
+            key2feats[k].append('s-len-%d' % f)
 
         # Song language. Missing if nan.
         if not np.isnan(row['language']):
-            key2feats[k].append(('s-lang', int(row['language'])))
+            key2feats[k].append('s-lang-%d' % row['language'])
 
         # Song year. Missing if nan. Rounded to 3-year intervals.
         # Song country. Missing if nan.
         if type(row['isrc']) is str:
             f = int(round_to(int(row['isrc'][5:7]), 3))
-            key2feats[k].append(('s-year', f))
-            key2feats[k].append(('s-country', row['isrc'][:2]))
+            key2feats[k].append('s-year-%d' % f)
+            key2feats[k].append('s-country-%s' % row['isrc'][:2])
 
         # Song genre(s). Missing if nan. Split on pipes.
-        gg = split_multi(row['genre_ids'])
-        if len(gg) > 0:
-            ggc = map(genre_id_counts.get, gg)
-            key2feats[k].append(('s-genre', gg[np.argmax(ggc)]))
+        if type(row['genre_ids']) is str:
+            for x in row['genre_ids'].split('|'):
+                key2feats[k].append('s-genre-%d' % int(x))
 
-        # TODO: consider artist, lyricist, musician separately.
-        mm = split_multi(row['artist_name'])
-        mm += split_multi(row['lyricist'])
-        mm += split_multi(row['composer'])
-        if len(mm) > 0:
-            mmc = map(musician_counts.get, mm)
-            key2feats[k].append(('s-musician', mm[np.argmax(mmc)]))
+        mm = parse_musicians(row['artist_name'])
+        mm += parse_musicians(row['composer'])
+        mm += parse_musicians(row['lyricist'])
+        key2feats[k] += list(set(mm))
 
         assert len(key2feats[k]) > 0, 'No features found for %s' % k
 
@@ -365,8 +341,9 @@ class MultiVecRec(object):
     def get_features(self, train=False, test=False):
 
         path_sample_keys_trn = '%s/data-sample-keys-trn.csv' % self.artifacts_dir
+
         path_sample_keys_tst = '%s/data-sample-keys-tst.csv' % self.artifacts_dir
-        path_feats = '%s/data-feats.pkl' % self.artifacts_dir
+        path_feats = '%s/data-feats.json' % self.artifacts_dir
 
         pp = [path_sample_keys_trn, path_sample_keys_tst, path_feats]
         feats_ready = sum([exists(p) for p in pp]) == len(pp)
@@ -375,7 +352,7 @@ class MultiVecRec(object):
 
             self.logger.info('Reading dataframes')
             SNG = pd.read_csv('%s/songs.csv' % self.data_dir)
-            SEI = pd.read_csv('%s/song_extra_info.csv' % self.data_dir, usecols=['song_id', 'isrc'])
+            SEI = pd.read_csv('%s/song_extra_info.csv' % self.data_dir)
             MMB = pd.read_csv('%s/members.csv' % self.data_dir)
             TRN = pd.read_csv('%s/train.csv' % self.data_dir)
             TST = pd.read_csv('%s/test.csv' % self.data_dir)
@@ -401,10 +378,10 @@ class MultiVecRec(object):
             skeys, skey2feats = get_song_feats(CMB, self.logger)
 
             self.logger.info('Saving features')
-            with open(path_feats, 'wb') as fp:
+            with open(path_feats, 'w') as fp:
                 feats = ukey2feats.copy()
                 feats.update(skey2feats)
-                pickle.dump(feats, fp)
+                json.dump(feats, fp, sort_keys=True, indent=2)
 
             self.logger.info('Saving training keys')
             keys_trn = pd.DataFrame({
@@ -422,39 +399,22 @@ class MultiVecRec(object):
             })
             keys_tst.to_csv(path_sample_keys_tst, index=False)
 
-            # Count occurrences of test features in training set.
-            with open(path_feats, 'rb') as fp:
-                feats = pickle.load(fp)
-            keys_trn = pd.read_csv(path_sample_keys_trn, usecols=['user', 'song'])
-            keys_tst = pd.read_csv(path_sample_keys_tst, usecols=['user', 'song'])
-            feats_trn = flatten(map(feats.get, flatten(keys_trn.values)))
-            feats_tst = flatten(map(feats.get, flatten(keys_tst.values)))
-            cntr_trn = Counter(feats_trn)
-            cntr_tst = Counter({k: cntr_trn[k] for k in set(feats_tst)})
-            cnts_trn = np.array(list(cntr_trn.values()))
-            cnts_tst = np.array(list(cntr_tst.values()))
+            # How many warm-start users?
+            U = set(keys_trn.user)
+            n = np.sum(keys_tst.user.apply(lambda x: x in U))
+            self.logger.info('Warm start users: %d, %.3lf' % (n, n / len(keys_tst)))
 
-            self.logger.info('Training set most common features')
-            self.logger.info(cntr_trn.most_common()[:6])
-            self.logger.info('Test set most common features')
-            self.logger.info(cntr_tst.most_common()[:6])
-            self.logger.info('Training set feature counts:')
-            self.logger.info('mean = %.2lf' % cnts_trn.mean())
-            self.logger.info('median = %d' % np.median(cnts_trn))
-            self.logger.info('max = %d' % cnts_trn.max())
-            self.logger.info('min = %d' % cnts_trn.min())
-            self.logger.info('Test set feature counts (occurring in the training set):')
-            self.logger.info('mean = %.2lf' % cnts_tst.mean())
-            self.logger.info('median = %d' % np.median(cnts_tst))
-            self.logger.info('max = %d' % cnts_tst.max())
-            self.logger.info('min = %d' % cnts_tst.min())
+            # How many warm-start songs?
+            S = set(keys_trn.song)
+            n = np.sum(keys_tst.song.apply(lambda x: x in S))
+            self.logger.info('Warm start songs: %d, %.3lf' % (n, n / len(keys_tst)))
 
         # Read from disk and return keys and features.
         self.logger.info('Reading features from disk')
         keys = pd.read_csv(path_sample_keys_trn) if train \
             else pd.read_csv(path_sample_keys_tst)
-        with open(path_feats, 'rb') as fp:
-            feats = pickle.load(fp)
+        with open(path_feats, 'r') as fp:
+            feats = json.load(fp)
 
         return keys, feats
 
@@ -462,36 +422,38 @@ class MultiVecRec(object):
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        _, Xv, _, yv = train_test_split(X, y, test_size=0.2)
+        _, Xv, _, yv = train_test_split(X, y, test_size=0.1, shuffle=False)
         val_loss, val_auc = iafm.fit(X, Xv, y, yv)
 
-    # def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
-    #     iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
-    #     X = samples[['user', 'song']].values
-    #     y = samples['target'].values
-    #     Xt, Xv, yt, yv = train_test_split(X, y, shuffle=False, test_size=0.2)
-    #     val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
+    def val(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        """
+        Cold-start users and songs in test set:
+        tst users in trn: 0.928
+        tst songs in trn: 0.875
 
-    def crossval(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        Using last 40% of rows for validation:
+        val users in trn: 0.910
+        val songs in trn: 0.873
+        """
         self.logger.info(pformat(IAFM_kwargs))
+        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+
+        # Split features.
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        losses, aucs = [], []
-        splitter = ShuffleSplit(n_splits=4, test_size=0.25)
-        s = 'Starting %d-fold cross-validation' % splitter.n_splits
-        self.logger.info('-' * len(s))
-        self.logger.info(s)
-        self.logger.info('-' * len(s))
-        for cvi, (ii_trn, ii_val) in enumerate(splitter.split(X, y)):
-            iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
-            val_loss, val_auc = iafm.fit(X[ii_trn], X[ii_val], y[ii_trn], y[ii_val])
-            losses.append(val_loss)
-            aucs.append(val_auc)
-            s = '%d: mean loss = %.3lf, mean auc = %.3lf' % (cvi, np.mean(losses), np.mean(aucs))
-            self.logger.info('-' * len(s))
-            self.logger.info(s)
-            self.logger.info('-' * len(s))
-        return np.mean(losses), np.mean(aucs)
+        Xt, Xv, yt, yv = train_test_split(X, y, test_size=0.5, shuffle=False)
+
+        # Display cold-start proportions.
+        s = set(Xt[:, 0])
+        n = sum(map(lambda x: x not in s, Xv[:, 0]))
+        self.logger.info('Cold-start users = %d, %.2lf' % (n, n / len(Xv)))
+
+        s = set(Xt[:, 1])
+        n = sum(map(lambda x: x not in s, Xv[:, 1]))
+        self.logger.info('Cold-start songs = %d, %.2lf' % (n, n / len(Xv)))
+
+        # Train.
+        val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
 
     def predict(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
@@ -506,8 +468,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description='')
     ap.add_argument('--fit', action='store_true', default=False)
+    ap.add_argument('--val', action='store_true', default=False)
     ap.add_argument('--predict', action='store_true', default=False)
-    ap.add_argument('--crossval', action='store_true', default=False)
     args = vars(ap.parse_args())
 
     model = MultiVecRec(
@@ -517,13 +479,11 @@ if __name__ == "__main__":
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
 
-    # model.get_features()
-
     if args['fit']:
         model.fit(*model.get_features(train=True))
 
     if args['predict']:
         model.predict(*model.get_features(test=True))
 
-    if args['crossval']:
-        model.crossval(*model.get_features(train=True))
+    if args['val']:
+        model.val(*model.get_features(train=True))
