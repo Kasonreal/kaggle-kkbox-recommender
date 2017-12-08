@@ -53,13 +53,13 @@ import keras.backend as K
 # }
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 30,
+    'vec_size': 25,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
     'dropout_prop': 0.5,
     'optimizer': SGD,
     'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
-    'nb_epochs_max': 100,
+    'nb_epochs_max': 50,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
