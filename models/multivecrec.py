@@ -30,8 +30,7 @@ from keras.engine.topology import Layer
 from keras.layers import Input, Embedding, Activation, Lambda, concatenate, multiply, dot
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
-from keras.optimizers import Adam, SGD
-from keras.regularizers import l2
+from keras.optimizers import Adam, SGD, Adagrad
 from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback, CSVLogger
 import keras.backend as K
 
@@ -52,10 +51,13 @@ import keras.backend as K
 #     'early_stop_patience': 2,
 # }
 
+# 'optimizer': Adagrad,
+# 'optimizer_kwargs': {'lr': 0.05},
+
 IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 25,
     'vecs_init_func': np.random.normal,
-    'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
+    'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
     'dropout_prop': 0.5,
     'optimizer': SGD,
     'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
@@ -128,6 +130,11 @@ class FeatureVectorInteractions(Layer):
         # Apply the combined mask to the product matrices via elem-wise multiply.
         P = P * cmb_mask
 
+        # TODO: implement dropout on P. Given a dropout proportion, that proportion
+        # of feature products should be randomly zeroed out. This is non-trivial to
+        # do correctly since each product matrix in the batch has a different
+        # number of products.
+
         # Return the sum of each matrix. This leaves a single scalar for each
         # pair of feature matrices, representing their sum of interactions.
         return K.expand_dims(K.sum(P, (1, 2)))
@@ -138,13 +145,14 @@ class FeatureVectorInteractions(Layer):
 
 class IAFM(object):
 
-    def __init__(self, key2feats, best_model_path, vec_size, vecs_init_func,
-                 vecs_init_kwargs, optimizer, optimizer_kwargs, dropout_prop,
-                 nb_epochs_max, batch_size, early_stop_metric, early_stop_delta,
-                 early_stop_patience):
+    def __init__(self, key2feats, best_model_path, history_path, vec_size,
+                 vecs_init_func, vecs_init_kwargs, optimizer, optimizer_kwargs,
+                 dropout_prop, nb_epochs_max, batch_size, early_stop_metric,
+                 early_stop_delta, early_stop_patience):
 
         self.key2feats = key2feats
         self.best_model_path = best_model_path
+        self.history_path = history_path
         self.vec_size = vec_size
         self.vecs_init_func = vecs_init_func
         self.vecs_init_kwargs = vecs_init_kwargs
@@ -203,8 +211,10 @@ class IAFM(object):
         W[0] *= 0
 
         # NOTE: If you use embedding regularizer, even vectors which were never
-        # used will be updated due to the regularization penalty. See:
+        # used will be updated due to the regularization penalty. It's possible
+        # that this is the cause for misleading validation scores. See discussion:
         # https://www.reddit.com/r/MachineLearning/comments/3y41si/
+        # V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
         V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
 
         # Compute feature vector interactions. Return *batch* scalars.
@@ -220,20 +230,13 @@ class IAFM(object):
             if shuffle:
                 np.random.shuffle(bii)
             for bii_ in chunked(bii, self.batch_size):
-
                 # Accumulate the batch of indexes into the VI matrix.
                 ii0, ii1 = [], []
                 for k0, k1 in X[bii_]:
                     ii0.append(self.key2VI_idx[k0])
                     ii1.append(self.key2VI_idx[k1])
-
-                # # Compute a randomized dropout mask.
-                # pdb.set_trace()
-                # D = np.random.binomial(1, 1. - dropout_prop, (len(ii0), self.nb_vi_max))
-
-                # Yield the batches from VI with dropout mask applied.
+                # Yield the batches from VI.
                 yield [self.VI[ii0], self.VI[ii1]], y[bii_]
-                # yield [self.VI[ii0] * D, self.VI[ii1]] * D, y[bii_]
 
     def fit(self, Xt, Xv, yt, yv):
 
@@ -262,6 +265,7 @@ class IAFM(object):
 
         cb = [
             VecReviewCallback(self.vi2feat, self.feat2cnt),
+            CSVLogger(self.history_path),
             ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
                             save_best_only=True, save_weights_only=True, mode='max'),
             EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
@@ -269,6 +273,17 @@ class IAFM(object):
         ]
 
         net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc, avg_pos, avg_neg])
+
+        # # NOTE: this is how to check which vectors get modified from a single training update.
+        # # With embedding regularization, all of the vectors get updated.
+        # Xb, yb = next(gen_trn)
+        # vecs0 = net.get_layer('vecs').get_weights()[0].copy()
+        # net.train_on_batch(Xb, yb)
+        # vecs1 = net.get_layer('vecs').get_weights()[0].copy()
+        # uniq = set(Xb[0].ravel().tolist() + Xb[1].ravel().tolist())
+        # diff = self.nb_vecs - np.sum(np.prod(vecs0 == vecs1, axis=1))
+        # print(len(uniq), diff)
+        # pdb.set_trace()
 
         history = net.fit_generator(
             epochs=self.nb_epochs_max, verbose=1, callbacks=cb,
@@ -428,10 +443,12 @@ class MultiVecRec(object):
                  data_dir,
                  artifacts_dir,
                  best_model_path,
+                 history_path,
                  predict_path):
 
         self.data_dir = data_dir
         self.artifacts_dir = artifacts_dir
+        self.history_path = history_path
         self.best_model_path = best_model_path
         self.predict_path = predict_path
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -518,7 +535,7 @@ class MultiVecRec(object):
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         self.logger.info(str(IAFM_kwargs))
-        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+        iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
         val_loss, val_auc = iafm.fit(X, X, y, y)
@@ -535,8 +552,8 @@ class MultiVecRec(object):
         val users in trn: 0.910
         val songs in trn: 0.873
         """
-        self.logger.info(pformat(IAFM_kwargs))
-        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+        self.logger.info(str(IAFM_kwargs))
+        iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
 
         # Split features.
         X = samples[['user', 'song']].values
@@ -555,8 +572,11 @@ class MultiVecRec(object):
         # Train.
         val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
 
+        self.logger.info('Best val_loss=%.4lf, val_auc=%.4lf' % (val_loss, val_auc))
+        self.logger.info(str(IAFM_kwargs))
+
     def predict(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
-        iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
+        iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
         yp = iafm.predict(samples[['user', 'song']].values)
         self.logger.info('yp mean=%.3lf' % (np.mean(yp)))
         df = pd.DataFrame({'id': samples['id'], 'target': yp})
@@ -576,6 +596,7 @@ if __name__ == "__main__":
         data_dir='data',
         artifacts_dir='artifacts/multivecrec',
         best_model_path='artifacts/multivecrec/model-iafm-best.hdf5',
+        history_path='artifacts/multivecrec/model-iafm-history.csv',
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
 
