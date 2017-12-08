@@ -32,7 +32,7 @@ from keras.models import Model, load_model
 from keras.initializers import RandomNormal
 from keras.optimizers import Adam, SGD
 from keras.regularizers import l2
-from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback
+from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback, CSVLogger
 import keras.backend as K
 
 # 0.62924
@@ -53,21 +53,17 @@ import keras.backend as K
 # }
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 10,
+    'vec_size': 30,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
-    'vecs_reg_func': l2,
-    'vecs_reg_kwargs': {'l': 0.0},
-    'dropout_prop': 0.0,
+    'dropout_prop': 0.5,
     'optimizer': SGD,
     'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
-    # 'optimizer': Adagrad,
-    # 'optimizer_kwargs': {'lr': 0.05},
-    'nb_epochs_max': 20,
+    'nb_epochs_max': 100,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
-    'early_stop_patience': 2,
+    'early_stop_patience': 5,
 }
 
 
@@ -143,17 +139,15 @@ class FeatureVectorInteractions(Layer):
 class IAFM(object):
 
     def __init__(self, key2feats, best_model_path, vec_size, vecs_init_func,
-                 vecs_init_kwargs, vecs_reg_func, vecs_reg_kwargs, optimizer,
-                 optimizer_kwargs, dropout_prop, nb_epochs_max, batch_size,
-                 early_stop_metric, early_stop_delta, early_stop_patience):
+                 vecs_init_kwargs, optimizer, optimizer_kwargs, dropout_prop,
+                 nb_epochs_max, batch_size, early_stop_metric, early_stop_delta,
+                 early_stop_patience):
 
         self.key2feats = key2feats
         self.best_model_path = best_model_path
         self.vec_size = vec_size
         self.vecs_init_func = vecs_init_func
         self.vecs_init_kwargs = vecs_init_kwargs
-        self.vecs_reg_func = vecs_reg_func
-        self.vecs_reg_kwargs = vecs_reg_kwargs
         self.optimizer = optimizer
         self.optimizer_kwargs = optimizer_kwargs
         self.dropout_prop = dropout_prop
@@ -163,6 +157,11 @@ class IAFM(object):
         self.early_stop_delta = early_stop_delta
         self.early_stop_patience = early_stop_patience
         self.logger = logging.getLogger(self.__class__.__name__)
+
+        # NOTE: If you just add an arbitrary feature to EVERY item, it ends up
+        # with one of the highest norms.
+        # for k in self.key2feats.keys():
+        #     self.key2feats[k].append('testing-norms')
 
         self.logger.info('Preprocessing features')
         # Compute all of the unique feature keys.
@@ -198,17 +197,15 @@ class IAFM(object):
         VI0 = Input((self.nb_vi_max,), name='VI0')
         VI1 = Input((self.nb_vi_max,), name='VI1')
 
-        # Setup vector space regularization
-        reg = self.vecs_reg_func(**self.vecs_reg_kwargs)
-
         # Initialize vector space weights. Vector 0 is all 0s.
         self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
         W = self.vecs_init_func(**self.vecs_init_kwargs)
         W[0] *= 0
 
-        # Build and initialize single vector space.
-        V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W],
-                      embeddings_regularizer=reg)
+        # NOTE: If you use embedding regularizer, even vectors which were never
+        # used will be updated due to the regularization penalty. See:
+        # https://www.reddit.com/r/MachineLearning/comments/3y41si/
+        V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
 
         # Compute feature vector interactions. Return *batch* scalars.
         I = FeatureVectorInteractions(name='fvi')([VI0, VI1, V(VI0), V(VI1)])
@@ -223,9 +220,20 @@ class IAFM(object):
             if shuffle:
                 np.random.shuffle(bii)
             for bii_ in chunked(bii, self.batch_size):
-                ii0 = [self.key2VI_idx[k] for k in X[bii_, 0]]
-                ii1 = [self.key2VI_idx[k] for k in X[bii_, 1]]
+
+                # Accumulate the batch of indexes into the VI matrix.
+                ii0, ii1 = [], []
+                for k0, k1 in X[bii_]:
+                    ii0.append(self.key2VI_idx[k0])
+                    ii1.append(self.key2VI_idx[k1])
+
+                # # Compute a randomized dropout mask.
+                # pdb.set_trace()
+                # D = np.random.binomial(1, 1. - dropout_prop, (len(ii0), self.nb_vi_max))
+
+                # Yield the batches from VI with dropout mask applied.
                 yield [self.VI[ii0], self.VI[ii1]], y[bii_]
+                # yield [self.VI[ii0] * D, self.VI[ii1]] * D, y[bii_]
 
     def fit(self, Xt, Xv, yt, yv):
 
@@ -261,8 +269,9 @@ class IAFM(object):
         ]
 
         net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc, avg_pos, avg_neg])
+
         history = net.fit_generator(
-            epochs=self.nb_epochs_max, verbose=1, callbacks=cb, max_queue_size=1000,
+            epochs=self.nb_epochs_max, verbose=1, callbacks=cb,
             generator=gen_trn, steps_per_epoch=ceil(len(Xt) / self.batch_size),
             validation_data=gen_val, validation_steps=ceil(len(Xv) / self.batch_size)
         )
@@ -298,7 +307,8 @@ def get_user_feats(df, logger):
     msno_trn = set(df.msno.values[:NTRN])
 
     # Remove duplicate based on Id.
-    df = df.drop_duplicates('msno')
+    cols = ['msno', 'bd', 'city', 'gender']
+    df = df[cols].drop_duplicates('msno')
     keys_dedup = df['msno'].apply(msno2key).values.tolist()
 
     # Build mapping from unique keys to features.
@@ -322,13 +332,6 @@ def get_user_feats(df, logger):
         # User gender. Missing if not female or male.
         if row['gender'] in {'male', 'female'}:
             key2feats[k].append('u-sex-%s' % row['gender'])
-
-        # User registration method. No missing values.
-        key2feats[k].append('u-reg-via-%d' % int(row['registered_via']))
-
-        # User registration year. No missing values.
-        y0 = int(str(row['registration_init_time'])[:4])
-        key2feats[k].append('u-reg-year-%d' % y0)
 
         assert len(key2feats[k]) > 0, 'No features found for %s' % k
 
@@ -374,7 +377,7 @@ def get_song_feats(df, logger):
             for t in s:
                 t = t.strip()
                 if len(t) > 0:
-                    r.append('s-musician-%s' % t)
+                    r.append(str.strip('s-musician-%s' % t))
         return r
 
     all_musicians = set()
@@ -383,20 +386,15 @@ def get_song_feats(df, logger):
 
         key2feats[k] = []
 
-        # Ad-hoc replacements.
-        if row['song_id'] == 'GQK/aYFW8elL+4o7Qo1zNSQmjYDKJfacYT2+QKWQ71U=':
-            row['isrc'] = 'ESAAI0205357'
-
         # Song hash. There are ~9K song records that have distinct song_ids
         # but otherwise identical properties. Use the hash of these properties
         # instead of the song_id as a unique identifier.
         song_hash = md5(str(row[hash_cols].values).encode()).hexdigest()
         key2feats[k].append('s-hash-%s' % song_hash)
 
-        # Song length. Missing if nan. Log transformed.
+        # Song length. Missing if nan. Log transform and round.
         if not np.isnan(row['song_length']):
-            f = round(log(1 + row['song_length'] / 1000 / 60))
-            key2feats[k].append('s-len-%d' % f)
+            key2feats[k].append('s-len-%d' % round(log(1 + row['song_length'])))
 
         # Song language. Missing if nan.
         if not np.isnan(row['language']):
@@ -519,11 +517,13 @@ class MultiVecRec(object):
         return keys, feats
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
-        self.logger.info(pformat(IAFM_kwargs))
+        self.logger.info(str(IAFM_kwargs))
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
         val_loss, val_auc = iafm.fit(X, X, y, y)
+        self.logger.info('Best val_loss=%.4lf, val_auc=%.4lf' % (val_loss, val_auc))
+        self.logger.info(str(IAFM_kwargs))
 
     def val(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         """
