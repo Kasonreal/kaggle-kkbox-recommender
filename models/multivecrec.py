@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import pdb
 import re
-import tensorflow as tf
 
 NTRN = 7377418
 NTST = 2556790
@@ -59,14 +58,35 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
     'dropout_prop': 0.5,
+    # 'optimizer': Adam,
+    # 'optimizer_kwargs': {'lr': 0.01},
     'optimizer': SGD,
     'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
     'nb_epochs_max': 50,
     'batch_size': 50000,
-    'early_stop_metric': 'val_auc_roc',
+    'early_stop_metric': 'val_auc',
     'early_stop_delta': 0.005,
     'early_stop_patience': 5,
 }
+
+
+class AUCCallback(Callback):
+
+    def __init__(self, Xt, Xv, yt, yv, batch_size):
+        self.Xt = Xt
+        self.Xv = Xv
+        self.yt = yt
+        self.yv = yv
+        self.batch_size = batch_size
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def on_epoch_end(self, batch, logs):
+        yp = self.model.predict(self.Xt, batch_size=self.batch_size)
+        logs['auc'] = roc_auc_score(self.yt, yp)
+        self.logger.info('Trn AUC = %.4lf' % logs['auc'])
+        yp = self.model.predict(self.Xv, batch_size=self.batch_size)
+        logs['val_auc'] = roc_auc_score(self.yv, yp)
+        self.logger.info('Val AUC = %.4lf' % logs['val_auc'])
 
 
 class VecReviewCallback(Callback):
@@ -120,20 +140,22 @@ class FeatureVectorInteractions(Layer):
         # Each of the VI0 and VI1 has a number of zero entries which should be
         # masked out. Compute row and column masks identifying non-zero entries.
         # Row mask must be permuted to represent rows instead of cols.
-        row_mask = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
-        row_mask = K.permute_dimensions(row_mask, (0, 2, 1))
-        col_mask = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
+        row_msk = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
+        row_msk = K.permute_dimensions(row_msk, (0, 2, 1))
+        col_msk = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
 
         # Combine the row and col masks into combined via elem-wise multiply.
-        cmb_mask = row_mask * col_mask
+        cmb_msk = row_msk * col_msk
 
         # Apply the combined mask to the product matrices via elem-wise multiply.
-        P = P * cmb_mask
+        P = P * cmb_msk
 
         # TODO: implement dropout on P. Given a dropout proportion, that proportion
         # of feature products should be randomly zeroed out. This is non-trivial to
         # do correctly since each product matrix in the batch has a different
         # number of products.
+
+        # TODO: implement l2 regularization on P to discourage large products on p.
 
         # Return the sum of each matrix. This leaves a single scalar for each
         # pair of feature matrices, representing their sum of interactions.
@@ -160,6 +182,7 @@ class IAFM(object):
         self.optimizer_kwargs = optimizer_kwargs
         self.dropout_prop = dropout_prop
         self.nb_epochs_max = nb_epochs_max
+
         self.batch_size = batch_size
         self.early_stop_metric = early_stop_metric
         self.early_stop_delta = early_stop_delta
@@ -224,86 +247,61 @@ class IAFM(object):
         classify = Activation('sigmoid')(I)
         return Model([VI0, VI1], classify)
 
-    def gen(self, X, y, shuffle, dropout_prop):
-        bii = np.arange(len(X))
-        while True:
-            if shuffle:
-                np.random.shuffle(bii)
-            for bii_ in chunked(bii, self.batch_size):
-                # Accumulate the batch of indexes into the VI matrix.
-                ii0, ii1 = [], []
-                for k0, k1 in X[bii_]:
-                    ii0.append(self.key2VI_idx[k0])
-                    ii1.append(self.key2VI_idx[k1])
-                # Yield the batches from VI.
-                yield [self.VI[ii0], self.VI[ii1]], y[bii_]
+    def _keys_to_vector_indexes(self, X_keys):
+        ii0, ii1 = [], []
+        for k0, k1 in X_keys:
+            ii0.append(self.key2VI_idx[k0])
+            ii1.append(self.key2VI_idx[k1])
+        return [self.VI[ii0], self.VI[ii1]]
 
-    def fit(self, Xt, Xv, yt, yv):
+    def fit(self, Xt_keys, Xv_keys, yt, yv):
 
-        def auc_roc(yt, yp):
-            """https://github.com/fchollet/keras/issues/6050"""
-            value, update_op = tf.contrib.metrics.streaming_auc(yp, yt)
-            metric_vars = [i for i in tf.local_variables() if 'auc_roc' in i.name.split('/')[1]]
-            for v in metric_vars:
-                tf.add_to_collection(tf.GraphKeys.GLOBAL_VARIABLES, v)
-            with tf.control_dependencies([update_op]):
-                value = tf.identity(value)
-                return value
-
-        def avg_pos(yt, yp):
+        # Custom metrics.
+        def pos_avg(yt, yp):
             return K.sum(yp * yt) / K.sum(yt)
 
-        def avg_neg(yt, yp):
+        def pos_ext(yt, yp):
+            return K.max(yp * yt)
+
+        def neg_avg(yt, yp):
             return K.sum(yp * (1 - yt)) / K.sum(1 - yt)
 
+        def neg_ext(yt, yp):
+            return K.min(yp * (1 - yt))
+
+        # Build network.
         net = self.net()
         net.summary()
 
-        opt = self.optimizer(**self.optimizer_kwargs)
-        gen_trn = self.gen(Xt, yt, shuffle=True, dropout_prop=self.dropout_prop)
-        gen_val = self.gen(Xv, yv, shuffle=True, dropout_prop=0.)
+        # Convert keys to vector indexes.
+        self.logger.info('Converting keys to vector indexes')
+        Xt = self._keys_to_vector_indexes(Xt_keys)
+        Xv = self._keys_to_vector_indexes(Xv_keys)
 
+        # Instantiate callbacks and compile network.
         cb = [
             VecReviewCallback(self.vi2feat, self.feat2cnt),
+            AUCCallback(Xt, Xv, yt, yv, self.batch_size),
             CSVLogger(self.history_path),
             ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
                             save_best_only=True, save_weights_only=True, mode='max'),
             EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
                           patience=self.early_stop_patience, verbose=1, mode='max'),
         ]
-
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=[auc_roc, avg_pos, avg_neg])
-
-        # # NOTE: this is how to check which vectors get modified from a single training update.
-        # # With embedding regularization, all of the vectors get updated.
-        # Xb, yb = next(gen_trn)
-        # vecs0 = net.get_layer('vecs').get_weights()[0].copy()
-        # net.train_on_batch(Xb, yb)
-        # vecs1 = net.get_layer('vecs').get_weights()[0].copy()
-        # uniq = set(Xb[0].ravel().tolist() + Xb[1].ravel().tolist())
-        # diff = self.nb_vecs - np.sum(np.prod(vecs0 == vecs1, axis=1))
-        # print(len(uniq), diff)
-        # pdb.set_trace()
-
-        history = net.fit_generator(
-            epochs=self.nb_epochs_max, verbose=1, callbacks=cb,
-            generator=gen_trn, steps_per_epoch=ceil(len(Xt) / self.batch_size),
-            validation_data=gen_val, validation_steps=ceil(len(Xv) / self.batch_size)
-        )
+        opt = self.optimizer(**self.optimizer_kwargs)
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['binary_accuracy'])
+        history = net.fit(Xt, yt, validation_data=(Xv, yv), batch_size=self.batch_size,
+                          epochs=self.nb_epochs_max, verbose=1, callbacks=cb)
 
         i = np.argmax(history.history['val_auc_roc'])
         return history.history['val_loss'][i], history.history['val_auc_roc'][i]
 
-    def predict(self, X):
+    def predict(self, X_keys):
         net = self.net()
         net.load_weights(self.best_model_path, by_name=True)
-        gen = self.gen(X, y=np.zeros(len(X)), shuffle=False, dropout_prop=0)
-        yp = []
-        for _ in tqdm(range(0, len(X), self.batch_size)):
-            X_, _ = next(gen)
-            yp_ = net.predict(X_, batch_size=self.batch_size)
-            yp += yp_[:, 0].tolist()
-        return yp
+        X = self._keys_to_vector_indexes(X_keys)
+        yp = net.predict(X, batch_size=self.batch_size, verbose=True)
+        return yp[:, 0]
 
 
 def round_to(n, r):
