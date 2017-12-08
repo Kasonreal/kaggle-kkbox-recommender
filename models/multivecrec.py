@@ -54,14 +54,14 @@ import keras.backend as K
 # 'optimizer_kwargs': {'lr': 0.05},
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 25,
+    'vec_size': 50,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
-    'dropout_prop': 0.5,
-    # 'optimizer': Adam,
-    # 'optimizer_kwargs': {'lr': 0.01},
-    'optimizer': SGD,
-    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
+    'dropout_prop': 0.8,
+    'optimizer': Adam,
+    'optimizer_kwargs': {'lr': 0.001, 'decay': 1e-4},
+    # 'optimizer': SGD,
+    # 'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
     'nb_epochs_max': 50,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc',
@@ -121,8 +121,10 @@ class VecReviewCallback(Callback):
 class FeatureVectorInteractions(Layer):
     """"""
 
-    def __init__(self, **kwargs):
+    def __init__(self, dropout_prop, **kwargs):
         super(FeatureVectorInteractions, self).__init__(**kwargs)
+        self.uses_learning_phase = True  # Needed for dropout.
+        self.dropout_prop = dropout_prop
 
     def build(self, input_shape):
         pass
@@ -149,6 +151,11 @@ class FeatureVectorInteractions(Layer):
 
         # Apply the combined mask to the product matrices via elem-wise multiply.
         P = P * cmb_msk
+
+        # In the learning phase, a binomial dropout mask is applied to
+        # zero-out random feature products.
+        D = K.random_binomial(K.shape(P), 1 - self.dropout_prop)
+        P = K.switch(K.learning_phase(), P * D, P)
 
         # TODO: implement dropout on P. Given a dropout proportion, that proportion
         # of feature products should be randomly zeroed out. This is non-trivial to
@@ -241,7 +248,8 @@ class IAFM(object):
         V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
 
         # Compute feature vector interactions. Return *batch* scalars.
-        I = FeatureVectorInteractions(name='fvi')([VI0, VI1, V(VI0), V(VI1)])
+        I = FeatureVectorInteractions(dropout_prop=self.dropout_prop, name='fvi')\
+            ([VI0, VI1, V(VI0), V(VI1)])
 
         # Apply sigmoid for classification and return network.
         classify = Activation('sigmoid')(I)
@@ -289,7 +297,7 @@ class IAFM(object):
                           patience=self.early_stop_patience, verbose=1, mode='max'),
         ]
         opt = self.optimizer(**self.optimizer_kwargs)
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['binary_accuracy'])
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
         history = net.fit(Xt, yt, validation_data=(Xv, yv), batch_size=self.batch_size,
                           epochs=self.nb_epochs_max, verbose=1, callbacks=cb)
 
@@ -543,12 +551,12 @@ class MultiVecRec(object):
     def val(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         """
         Cold-start users and songs in test set:
-        tst users in trn: 0.928
-        tst songs in trn: 0.875
+        Cold-start users: 184018, 0.072
+        Cold-start songs: 320125, 0.125
 
-        Using last 40% of rows for validation:
-        val users in trn: 0.910
-        val songs in trn: 0.873
+        Using last 33% of rows for validation:
+        Cold-start users: 202162, 0.083
+        Cold-start songs: 308135, 0.127
         """
         self.logger.info(str(IAFM_kwargs))
         iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
@@ -556,16 +564,15 @@ class MultiVecRec(object):
         # Split features.
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        Xt, Xv, yt, yv = train_test_split(X, y, test_size=0.5, shuffle=False)
+        Xt, Xv, yt, yv = train_test_split(X, y, test_size=0.33, shuffle=False)
 
         # Display cold-start proportions.
         s = set(Xt[:, 0])
         n = sum(map(lambda x: x not in s, Xv[:, 0]))
-        self.logger.info('Cold-start users = %d, %.2lf' % (n, n / len(Xv)))
-
+        self.logger.info('Cold-start users = %d, %.3lf' % (n, n / len(Xv)))
         s = set(Xt[:, 1])
         n = sum(map(lambda x: x not in s, Xv[:, 1]))
-        self.logger.info('Cold-start songs = %d, %.2lf' % (n, n / len(Xv)))
+        self.logger.info('Cold-start songs = %d, %.3lf' % (n, n / len(Xv)))
 
         # Train.
         val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
@@ -597,6 +604,16 @@ if __name__ == "__main__":
         history_path='artifacts/multivecrec/model-iafm-history.csv',
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
+
+    # # How many warm-start users and songs?
+    # keys_trn, key2feats = model.get_features(train=True)
+    # keys_tst, key2feats = model.get_features(test=True)
+    # U = set(keys_trn.user)
+    # n = np.sum(keys_tst.user.apply(lambda x: x not in U))
+    # print('Cold-start users: %d, %.3lf' % (n, n / len(keys_tst)))
+    # S = set(keys_trn.song)
+    # n = np.sum(keys_tst.song.apply(lambda x: x not in S))
+    # print('Cold-start songs: %d, %.3lf' % (n, n / len(keys_tst)))
 
     if args['fit']:
         model.fit(*model.get_features(train=True))
