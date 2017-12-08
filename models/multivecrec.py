@@ -30,10 +30,27 @@ from keras.engine.topology import Layer
 from keras.layers import Input, Embedding, Activation, Lambda, concatenate, multiply, dot
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
-from keras.optimizers import Adam
+from keras.optimizers import Adam, SGD
 from keras.regularizers import l2
 from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback
 import keras.backend as K
+
+# 0.62924
+# IAFM_HYPERPARAMS_DEFAULT = {
+#     'vec_size': 10,
+#     'vecs_init_func': np.random.normal,
+#     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
+#     'vecs_reg_func': l2,
+#     'vecs_reg_kwargs': {'l': 0.0001},
+#     'dropout_prop': 0.0,
+#     'optimizer': Adam,
+#     'optimizer_kwargs': {'lr': 0.01},
+#     'nb_epochs_max': 20,
+#     'batch_size': 50000,
+#     'early_stop_metric': 'val_auc_roc',
+#     'early_stop_delta': 0.005,
+#     'early_stop_patience': 2,
+# }
 
 IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 10,
@@ -42,9 +59,11 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vecs_reg_func': l2,
     'vecs_reg_kwargs': {'l': 0.0},
     'dropout_prop': 0.0,
-    'optimizer': Adam,
-    'optimizer_kwargs': {'lr': 0.01},
-    'nb_epochs_max': 5,
+    'optimizer': SGD,
+    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
+    # 'optimizer': Adagrad,
+    # 'optimizer_kwargs': {'lr': 0.05},
+    'nb_epochs_max': 20,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc_roc',
     'early_stop_delta': 0.005,
@@ -54,8 +73,9 @@ IAFM_HYPERPARAMS_DEFAULT = {
 
 class VecReviewCallback(Callback):
 
-    def __init__(self, vi2feat, nb_samples=6):
+    def __init__(self, vi2feat, feat2cnt, nb_samples=15):
         self.vi2feat = vi2feat
+        self.feat2cnt = feat2cnt
         self.nb_samples = nb_samples
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -66,16 +86,18 @@ class VecReviewCallback(Callback):
         vecs = self.model.get_layer('vecs').get_weights()[0]
 
         # Make sure the padding vector has not been changed.
-        assert np.all(vecs[0] == np.zeros_like(vecs[0])), 'Vector 0 must be all-zero'
+        assert np.all(vecs[0] == vecs[0] * 0), 'Vector 0 must be all-zero'
 
         # Compute and sort vector norms. Print those with highest and lowest norm.
         norms = np.sqrt(np.sum(vecs ** 2, 1))
         norms_vi = np.argsort(norms)
         for i in reversed(norms_vi[-self.nb_samples:]):
-            self.logger.info('%-60s %.3lf' % (self.vi2feat[i].strip(), norms[i]))
+            f = self.vi2feat[i]
+            self.logger.info('%-60s %d %.3lf' % (f, self.feat2cnt[f], norms[i]))
         self.logger.info('...')
         for i in reversed(norms_vi[:self.nb_samples]):
-            self.logger.info('%-60s %.3lf' % (self.vi2feat[i].strip(), norms[i]))
+            f = self.vi2feat[i]
+            self.logger.info('%-60s %d %.3lf' % (f, self.feat2cnt[f], norms[i]))
 
 
 class FeatureVectorInteractions(Layer):
@@ -88,7 +110,11 @@ class FeatureVectorInteractions(Layer):
         pass
 
     def call(self, inputs):
-        VI0, VI1, V0, V1 = inputs
+
+        VI0 = inputs[0]  # Vector indexes representing each user's properties.
+        VI1 = inputs[1]  # Vector indexes representing each item's properties.
+        V0 = inputs[2]   # Matrix of row vectors for each user's properties.
+        V1 = inputs[3]   # Matrix of row vectors for each item's properties.
 
         # Multiply the feature matrices to get *b* matrices of pair-wise feature products.
         P = K.batch_dot(V0, K.permute_dimensions(V1, (0, 2, 1)), (2, 1))
@@ -141,12 +167,15 @@ class IAFM(object):
         self.logger.info('Preprocessing features')
         # Compute all of the unique feature keys.
         # Sort them to ensure reproducibility (as long as no new features are added).
-        feats_unique = set(flatten(self.key2feats.values()))
-        feats_unique = sorted(feats_unique, key=str)
+        feats_all = list(flatten(self.key2feats.values()))
+        feats_unique = sorted(set(feats_all), key=str)
 
         # Map feature string -> vector index and vice-versa. Add 1 for padding index.
         self.feat2vi = {f: i for i, f in enumerate(['padding'] + feats_unique)}
         self.vi2feat = {i: f for f, i in self.feat2vi.items()}
+
+        # Count the features.
+        self.feat2cnt = Counter(feats_all)
 
         # Number of vectors required. One per feature plus padding vector.
         self.nb_vecs = len(self.feat2vi) + 1
@@ -224,7 +253,7 @@ class IAFM(object):
         gen_val = self.gen(Xv, yv, shuffle=True, dropout_prop=0.)
 
         cb = [
-            VecReviewCallback(self.vi2feat),
+            VecReviewCallback(self.vi2feat, self.feat2cnt),
             ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
                             save_best_only=True, save_weights_only=True, mode='max'),
             EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
@@ -490,11 +519,11 @@ class MultiVecRec(object):
         return keys, feats
 
     def fit(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
+        self.logger.info(pformat(IAFM_kwargs))
         iafm = IAFM(key2feats, self.best_model_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        _, Xv, _, yv = train_test_split(X, y, test_size=0.05, shuffle=False)
-        val_loss, val_auc = iafm.fit(X, Xv, y, yv)
+        val_loss, val_auc = iafm.fit(X, X, y, y)
 
     def val(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         """
