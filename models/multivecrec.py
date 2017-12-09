@@ -57,16 +57,16 @@ IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 50,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
-    'dropout_prop': 0.8,
-    'optimizer': Adam,
-    'optimizer_kwargs': {'lr': 0.001, 'decay': 1e-4},
-    # 'optimizer': SGD,
-    # 'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
-    'nb_epochs_max': 50,
+    'dropout_prop': 0.5,
+    # 'optimizer': Adam,
+    # 'optimizer_kwargs': {'lr': 0.001, 'decay': 1e-4},
+    'optimizer': SGD,
+    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
+    'nb_epochs_max': 1,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc',
     'early_stop_delta': 0.005,
-    'early_stop_patience': 5,
+    'early_stop_patience': 999,
 }
 
 
@@ -142,29 +142,47 @@ class FeatureVectorInteractions(Layer):
         # Each of the VI0 and VI1 has a number of zero entries which should be
         # masked out. Compute row and column masks identifying non-zero entries.
         # Row mask must be permuted to represent rows instead of cols.
-        row_msk = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
-        row_msk = K.permute_dimensions(row_msk, (0, 2, 1))
-        col_msk = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
+        row_masks = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
+        row_masks = K.permute_dimensions(row_masks, (0, 2, 1))
+        col_masks = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
 
-        # Combine the row and col masks into combined via elem-wise multiply.
-        cmb_msk = row_msk * col_msk
+        # Combine the row and col masks into masks where active (non-padded)
+        # elements have value 1 and padding elements have value 0. This is
+        # a unique mask for each product matrix.
+        active_masks = row_masks * col_masks
 
-        # Apply the combined mask to the product matrices via elem-wise multiply.
-        P = P * cmb_msk
+        # Apply the active mask to the product matrices via elem-wise multiply.
+        P = P * active_masks
 
-        # In the learning phase, a binomial dropout mask is applied to
-        # zero-out random feature products.
-        D = K.random_binomial(K.shape(P), 1 - self.dropout_prop)
-        P = K.switch(K.learning_phase(), P * D, P)
+        if 0. < self.dropout_prop < 1.:
 
-        # TODO: implement dropout on P. Given a dropout proportion, that proportion
-        # of feature products should be randomly zeroed out. This is non-trivial to
-        # do correctly since each product matrix in the batch has a different
-        # number of products.
+            # For dropout, compute binary masks where non-dropped elements
+            # have value 1 and dropped elements have value 0.
+            keep_masks = K.random_uniform(K.shape(P), 0., 1.)
 
-        # TODO: implement l2 regularization on P to discourage large products on p.
+            # Count total elements and active elements at each product matrix.
+            total_cnts = K.sum(K.clip(active_masks, 1, 1))
+            active_cnts = K.sum(active_masks, (1, 2))
 
-        # Return the sum of each matrix. This leaves a single scalar for each
+            # Compute probability of dropping an element at each product matrix.
+            # e.g. with 30 active elements, 100 total elements, and dropout
+            # rate 0.1, p(drop) = 30 * 0.1 / 100 = 0.03.
+            prob_drop = (active_cnts * self.dropout_prop / total_cnts)
+
+            # Stripe the drop probabilities to match the batch shape.
+            # TODO: fine a less ugly way to do this.
+            prob_drop = K.expand_dims(K.expand_dims(prob_drop))
+            prob_drop = K.repeat_elements(prob_drop, K.int_shape(P)[1], 1)
+            prob_drop = K.repeat_elements(prob_drop, K.int_shape(P)[2], 2)
+
+            # Subtract the probability of dropping each element from the random
+            # uniform values. Then round to make a binary mask.
+            keep_masks = K.cast(K.round(keep_masks - prob_drop), 'float32')
+
+            # Applied only in learning phase.
+            P = K.switch(K.learning_phase(), P * keep_masks, P)
+
+        # Return the sum of each product matrix, a single scalar for each
         # pair of feature matrices, representing their sum of interactions.
         return K.expand_dims(K.sum(P, (1, 2)))
 
@@ -301,8 +319,8 @@ class IAFM(object):
         history = net.fit(Xt, yt, validation_data=(Xv, yv), batch_size=self.batch_size,
                           epochs=self.nb_epochs_max, verbose=1, callbacks=cb)
 
-        i = np.argmax(history.history['val_auc_roc'])
-        return history.history['val_loss'][i], history.history['val_auc_roc'][i]
+        i = np.argmax(history.history['val_auc'])
+        return history.history['val_loss'][i], history.history['val_auc'][i]
 
     def predict(self, X_keys):
         net = self.net()
