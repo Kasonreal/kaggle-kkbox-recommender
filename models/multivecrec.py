@@ -54,19 +54,19 @@ import keras.backend as K
 # 'optimizer_kwargs': {'lr': 0.05},
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 50,
+    'vec_size': 60,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
-    'dropout_prop': 0.5,
+    'dropout_prop': 0.4,
     # 'optimizer': Adam,
-    # 'optimizer_kwargs': {'lr': 0.001, 'decay': 1e-4},
+    # 'optimizer_kwargs': {'lr': 0.01, 'decay': 1e-4},
     'optimizer': SGD,
-    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-4, 'momentum': 0.9, 'nesterov': True},
-    'nb_epochs_max': 1,
+    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-3, 'momentum': 0.9, 'nesterov': True},
+    'nb_epochs_max': 100,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc',
     'early_stop_delta': 0.005,
-    'early_stop_patience': 999,
+    'early_stop_patience': 10,
 }
 
 
@@ -84,14 +84,17 @@ class AUCCallback(Callback):
         yp = self.model.predict(self.Xt, batch_size=self.batch_size)
         logs['auc'] = roc_auc_score(self.yt, yp)
         self.logger.info('Trn AUC = %.4lf' % logs['auc'])
-        yp = self.model.predict(self.Xv, batch_size=self.batch_size)
-        logs['val_auc'] = roc_auc_score(self.yv, yp)
+        if len(self.yt) == len(self.yv) and np.all(self.yt == self.yv):
+            logs['val_auc'] = logs['auc']
+        else:
+            yp = self.model.predict(self.Xv, batch_size=self.batch_size)
+            logs['val_auc'] = roc_auc_score(self.yv, yp)
         self.logger.info('Val AUC = %.4lf' % logs['val_auc'])
 
 
 class VecReviewCallback(Callback):
 
-    def __init__(self, vi2feat, feat2cnt, nb_samples=15):
+    def __init__(self, vi2feat, feat2cnt, nb_samples=4):
         self.vi2feat = vi2feat
         self.feat2cnt = feat2cnt
         self.nb_samples = nb_samples
@@ -154,33 +157,11 @@ class FeatureVectorInteractions(Layer):
         # Apply the active mask to the product matrices via elem-wise multiply.
         P = P * active_masks
 
+        # For dropout, compute a binary binomial mask to 0 out elements.
         if 0. < self.dropout_prop < 1.:
-
-            # For dropout, compute binary masks where non-dropped elements
-            # have value 1 and dropped elements have value 0.
-            keep_masks = K.random_uniform(K.shape(P), 0., 1.)
-
-            # Count total elements and active elements at each product matrix.
-            total_cnts = K.sum(K.clip(active_masks, 1, 1))
-            active_cnts = K.sum(active_masks, (1, 2))
-
-            # Compute probability of dropping an element at each product matrix.
-            # e.g. with 30 active elements, 100 total elements, and dropout
-            # rate 0.1, p(drop) = 30 * 0.1 / 100 = 0.03.
-            prob_drop = (active_cnts * self.dropout_prop / total_cnts)
-
-            # Stripe the drop probabilities to match the batch shape.
-            # TODO: fine a less ugly way to do this.
-            prob_drop = K.expand_dims(K.expand_dims(prob_drop))
-            prob_drop = K.repeat_elements(prob_drop, K.int_shape(P)[1], 1)
-            prob_drop = K.repeat_elements(prob_drop, K.int_shape(P)[2], 2)
-
-            # Subtract the probability of dropping each element from the random
-            # uniform values. Then round to make a binary mask.
-            keep_masks = K.cast(K.round(keep_masks - prob_drop), 'float32')
-
-            # Applied only in learning phase.
-            P = K.switch(K.learning_phase(), P * keep_masks, P)
+            P = K.switch(K.learning_phase(),
+                         P * K.random_binomial(K.shape(P), 1 - self.dropout_prop),
+                         P)
 
         # Return the sum of each product matrix, a single scalar for each
         # pair of feature matrices, representing their sum of interactions.
@@ -247,16 +228,22 @@ class IAFM(object):
             self.VI[i, :len(feats)] = [self.feat2vi[f] for f in feats]
             self.key2VI_idx[key] = i
 
-    def net(self):
+    def net(self, VI_warm=set()):
 
         # Three inputs: user vector indexes, song vector indexes.
         VI0 = Input((self.nb_vi_max,), name='VI0')
         VI1 = Input((self.nb_vi_max,), name='VI1')
 
-        # Initialize vector space weights. Vector 0 is all 0s.
+        # Initialize vector space weights.
         self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.vec_size)})
         W = self.vecs_init_func(**self.vecs_init_kwargs)
-        W[0] *= 0
+
+        # Zero-out any cold-start vectors.
+        VI_warm -= {0}
+        for vi in self.vi2feat.keys():
+            W[vi] *= vi in VI_warm
+        self.logger.info('Nullified %d cold-start vectors' % (self.nb_vecs - len(VI_warm)))
+        self.logger.info('Preserved %d warm-start vectors' % len(VI_warm))
 
         # NOTE: If you use embedding regularizer, even vectors which were never
         # used will be updated due to the regularization penalty. It's possible
@@ -295,14 +282,15 @@ class IAFM(object):
         def neg_ext(yt, yp):
             return K.min(yp * (1 - yt))
 
-        # Build network.
-        net = self.net()
-        net.summary()
-
         # Convert keys to vector indexes.
         self.logger.info('Converting keys to vector indexes')
         Xt = self._keys_to_vector_indexes(Xt_keys)
         Xv = self._keys_to_vector_indexes(Xv_keys)
+
+        # Build network.
+        VI_warm = set(Xt[0].ravel().tolist() + Xt[1].ravel().tolist())
+        net = self.net(VI_warm)
+        net.summary()
 
         # Instantiate callbacks and compile network.
         cb = [
@@ -315,7 +303,7 @@ class IAFM(object):
                           patience=self.early_stop_patience, verbose=1, mode='max'),
         ]
         opt = self.optimizer(**self.optimizer_kwargs)
-        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
+        net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy', pos_avg, neg_avg])
         history = net.fit(Xt, yt, validation_data=(Xv, yv), batch_size=self.batch_size,
                           epochs=self.nb_epochs_max, verbose=1, callbacks=cb)
 
@@ -346,7 +334,7 @@ def get_user_feats(df, logger):
     msno_trn = set(df.msno.values[:NTRN])
 
     # Remove duplicate based on Id.
-    cols = ['msno', 'bd', 'city', 'gender']
+    cols = ['msno', 'bd', 'city', 'gender', 'registration_init_time']
     df = df[cols].drop_duplicates('msno')
     keys_dedup = df['msno'].apply(msno2key).values.tolist()
 
@@ -359,18 +347,22 @@ def get_user_feats(df, logger):
 
         # User msno (id). Missing if not in training set.
         if row['msno'] in msno_trn:
-            key2feats[k].append('u-msno-%s' % row['msno'])
+            key2feats[k].append('u-id::%s' % row['msno'])
 
         # User age. Clipped and rounded.
         if 0 < row['bd'] < 70:
-            key2feats[k].append('u-age-%d' % round_to(row['bd'], 5))
+            key2feats[k].append('u-age::%d' % round_to(row['bd'], 5))
 
         # User city. No missing values.
-        key2feats[k].append('u-city-%d' % int(row['city']))
+        key2feats[k].append('u-city::%d' % int(row['city']))
 
         # User gender. Missing if not female or male.
         if row['gender'] in {'male', 'female'}:
-            key2feats[k].append('u-sex-%s' % row['gender'])
+            key2feats[k].append('u-sex::%s' % row['gender'])
+
+        # User registration year. No missing values.
+        y0 = int(str(row['registration_init_time'])[:4])
+        key2feats[k].append('u-reg-year::%s' % y0)
 
         assert len(key2feats[k]) > 0, 'No features found for %s' % k
 
@@ -416,7 +408,7 @@ def get_song_feats(df, logger):
             for t in s:
                 t = t.strip()
                 if len(t) > 0:
-                    r.append(str.strip('s-musician-%s' % t))
+                    r.append(str.strip('s-musician::%s' % t))
         return r
 
     all_musicians = set()
@@ -429,27 +421,27 @@ def get_song_feats(df, logger):
         # but otherwise identical properties. Use the hash of these properties
         # instead of the song_id as a unique identifier.
         song_hash = md5(str(row[hash_cols].values).encode()).hexdigest()
-        key2feats[k].append('s-hash-%s' % song_hash)
+        key2feats[k].append('s-hash::%s' % song_hash)
 
         # Song length. Missing if nan. Log transform and round.
         if not np.isnan(row['song_length']):
-            key2feats[k].append('s-len-%d' % round(log(1 + row['song_length'])))
+            key2feats[k].append('s-len::%d' % round(log(1 + row['song_length'])))
 
         # Song language. Missing if nan.
         if not np.isnan(row['language']):
-            key2feats[k].append('s-lang-%d' % row['language'])
+            key2feats[k].append('s-lang::%d' % row['language'])
 
         # Song year. Missing if nan. Rounded to 3-year intervals.
         # Song country. Missing if nan.
         if type(row['isrc']) is str:
             f = int(round_to(int(row['isrc'][5:7]), 3))
-            key2feats[k].append('s-year-%d' % f)
-            key2feats[k].append('s-country-%s' % row['isrc'][:2])
+            key2feats[k].append('s-year::%d' % f)
+            key2feats[k].append('s-country::%s' % row['isrc'][:2])
 
         # Song genre(s). Missing if nan. Split on pipes.
         if type(row['genre_ids']) is str:
             for x in row['genre_ids'].split('|'):
-                key2feats[k].append('s-genre-%d' % int(x))
+                key2feats[k].append('s-genre::%d' % int(x))
 
         mm = parse_musicians(row['artist_name'])
         mm += parse_musicians(row['composer'])
@@ -575,6 +567,10 @@ class MultiVecRec(object):
         Using last 33% of rows for validation:
         Cold-start users: 202162, 0.083
         Cold-start songs: 308135, 0.127
+
+        Using last 20% of rows for validation:
+        Cold-start users = 104479, 0.071
+        Cold-start songs = 126614, 0.086
         """
         self.logger.info(str(IAFM_kwargs))
         iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
@@ -582,7 +578,7 @@ class MultiVecRec(object):
         # Split features.
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        Xt, Xv, yt, yv = train_test_split(X, y, test_size=0.33, shuffle=False)
+        Xt, Xv, yt, yv = train_test_split(X, y, test_size=0.2, shuffle=False)
 
         # Display cold-start proportions.
         s = set(Xt[:, 0])
@@ -622,16 +618,6 @@ if __name__ == "__main__":
         history_path='artifacts/multivecrec/model-iafm-history.csv',
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
-
-    # # How many warm-start users and songs?
-    # keys_trn, key2feats = model.get_features(train=True)
-    # keys_tst, key2feats = model.get_features(test=True)
-    # U = set(keys_trn.user)
-    # n = np.sum(keys_tst.user.apply(lambda x: x not in U))
-    # print('Cold-start users: %d, %.3lf' % (n, n / len(keys_tst)))
-    # S = set(keys_trn.song)
-    # n = np.sum(keys_tst.song.apply(lambda x: x not in S))
-    # print('Cold-start songs: %d, %.3lf' % (n, n / len(keys_tst)))
 
     if args['fit']:
         model.fit(*model.get_features(train=True))
