@@ -33,36 +33,15 @@ from keras.optimizers import Adam, SGD, Adagrad
 from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback, CSVLogger
 import keras.backend as K
 
-# 0.62924
-# IAFM_HYPERPARAMS_DEFAULT = {
-#     'vec_size': 10,
-#     'vecs_init_func': np.random.normal,
-#     'vecs_init_kwargs': {'loc': 0, 'scale': 0.01},
-#     'vecs_reg_func': l2,
-#     'vecs_reg_kwargs': {'l': 0.0001},
-#     'dropout_prop': 0.0,
-#     'optimizer': Adam,
-#     'optimizer_kwargs': {'lr': 0.01},
-#     'nb_epochs_max': 20,
-#     'batch_size': 50000,
-#     'early_stop_metric': 'val_auc_roc',
-#     'early_stop_delta': 0.005,
-#     'early_stop_patience': 2,
-# }
-
-# 'optimizer': Adagrad,
-# 'optimizer_kwargs': {'lr': 0.05},
 
 IAFM_HYPERPARAMS_DEFAULT = {
     'vec_size': 60,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
-    'dropout_prop': 0.4,
-    # 'optimizer': Adam,
-    # 'optimizer_kwargs': {'lr': 0.01, 'decay': 1e-4},
-    'optimizer': SGD,
-    'optimizer_kwargs': {'lr': 1.0, 'decay': 1e-3, 'momentum': 0.9, 'nesterov': True},
-    'nb_epochs_max': 100,
+    'dropout_prop': 0.55,
+    'optimizer': Adagrad,
+    'optimizer_kwargs': {'lr': 0.01},
+    'nb_epochs_max': 15,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc',
     'early_stop_delta': 0.005,
@@ -209,6 +188,12 @@ class IAFM(object):
         # Map feature string -> vector index and vice-versa. Add 1 for padding index.
         self.feat2vi = {f: i for i, f in enumerate(['padding'] + feats_unique)}
         self.vi2feat = {i: f for f, i in self.feat2vi.items()}
+
+        # with open('vi2feat.json', 'w') as fp:
+        #     json.dump(self.vi2feat, fp)
+        # with open('feat2vi.json', 'w') as fp:
+        #     json.dump(self.feat2vi, fp)
+        # pdb.set_trace()
 
         # Count the features.
         self.feat2cnt = Counter(feats_all)
