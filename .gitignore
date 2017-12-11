@@ -2,5 +2,6 @@ data/*
 !data/.keep
 artifacts/*
 !artifacts/.keep
-notebooks/.ipynb_
+notebooks/.ipynb_*
 **/__pycache__
+out/*

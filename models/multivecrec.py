@@ -4,7 +4,7 @@ from math import log, ceil
 from more_itertools import flatten, chunked
 from multiprocessing import Pool, cpu_count
 from os.path import exists
-from os import getenv
+from os import getenv, getpid
 from pprint import pformat
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split, ShuffleSplit
@@ -29,24 +29,34 @@ from keras.engine.topology import Layer
 from keras.layers import Input, Embedding, Activation, Lambda, concatenate, multiply, dot
 from keras.models import Model, load_model
 from keras.initializers import RandomNormal
-from keras.optimizers import Adam, SGD, Adagrad
-from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback, CSVLogger
+from keras.optimizers import Adam, SGD, Adagrad, Adadelta, RMSprop
+from keras.callbacks import ModelCheckpoint, EarlyStopping, Callback, CSVLogger, TensorBoard
 import keras.backend as K
 
 
 IAFM_HYPERPARAMS_DEFAULT = {
-    'vec_size': 60,
+    'vec_size': 50,
     'vecs_init_func': np.random.normal,
-    'vecs_init_kwargs': {'loc': 0, 'scale': 0.1},
-    'dropout_prop': 0.55,
+    'vecs_init_kwargs': {'loc': 0, 'scale': 0.05},
+    'dropout_prop': 0.25,
     'optimizer': Adagrad,
     'optimizer_kwargs': {'lr': 0.01},
     'nb_epochs_max': 15,
     'batch_size': 50000,
     'early_stop_metric': 'val_auc',
-    'early_stop_delta': 0.005,
-    'early_stop_patience': 10,
+    'early_stop_delta': 1e-4,
+    'early_stop_patience': 2,
 }
+
+
+class BadModelStopper(Callback):
+
+    def __init__(self):
+        pass
+
+    def on_epoch_end(self, epoch, logs):
+        if logs['acc'] < 0.57:
+            self.model.stop_training = True
 
 
 class AUCCallback(Callback):
@@ -60,6 +70,7 @@ class AUCCallback(Callback):
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def on_epoch_end(self, batch, logs):
+        print('\n')
         yp = self.model.predict(self.Xt, batch_size=self.batch_size)
         logs['auc'] = roc_auc_score(self.yt, yp)
         self.logger.info('Trn AUC = %.4lf' % logs['auc'])
@@ -121,12 +132,14 @@ class FeatureVectorInteractions(Layer):
         # Multiply the feature matrices to get *b* matrices of pair-wise feature products.
         P = K.batch_dot(V0, K.permute_dimensions(V1, (0, 2, 1)), (2, 1))
 
+        # TODO: Normalize the products such that each is between 0 and 1.
+
         # Each of the VI0 and VI1 has a number of zero entries which should be
         # masked out. Compute row and column masks identifying non-zero entries.
         # Row mask must be permuted to represent rows instead of cols.
         row_masks = K.repeat(K.clip(VI0, 0, 1), P.shape[1])
         row_masks = K.permute_dimensions(row_masks, (0, 2, 1))
-        col_masks = K.repeat(K.clip(VI1, 0, 1), P.shape[1])
+        col_masks = K.repeat(K.clip(VI1, 0, 1), P.shape[2])
 
         # Combine the row and col masks into masks where active (non-padded)
         # elements have value 1 and padding elements have value 0. This is
@@ -174,12 +187,8 @@ class IAFM(object):
         self.early_stop_patience = early_stop_patience
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # NOTE: If you just add an arbitrary feature to EVERY item, it ends up
-        # with one of the highest norms.
-        # for k in self.key2feats.keys():
-        #     self.key2feats[k].append('testing-norms')
-
         self.logger.info('Preprocessing features')
+
         # Compute all of the unique feature keys.
         # Sort them to ensure reproducibility (as long as no new features are added).
         feats_all = list(flatten(self.key2feats.values()))
@@ -189,17 +198,11 @@ class IAFM(object):
         self.feat2vi = {f: i for i, f in enumerate(['padding'] + feats_unique)}
         self.vi2feat = {i: f for f, i in self.feat2vi.items()}
 
-        # with open('vi2feat.json', 'w') as fp:
-        #     json.dump(self.vi2feat, fp)
-        # with open('feat2vi.json', 'w') as fp:
-        #     json.dump(self.feat2vi, fp)
-        # pdb.set_trace()
-
         # Count the features.
         self.feat2cnt = Counter(feats_all)
 
         # Number of vectors required. One per feature plus padding vector.
-        self.nb_vecs = len(self.feat2vi) + 1
+        self.nb_vecs = len(self.feat2vi)
 
         # Max number of feature indexes.
         self.nb_vi_max = max(map(len, self.key2feats.values()))
@@ -226,7 +229,9 @@ class IAFM(object):
         # Zero-out any cold-start vectors.
         VI_warm -= {0}
         for vi in self.vi2feat.keys():
-            W[vi] *= vi in VI_warm
+            if vi not in VI_warm:
+                W[vi] *= 0
+
         self.logger.info('Nullified %d cold-start vectors' % (self.nb_vecs - len(VI_warm)))
         self.logger.info('Preserved %d warm-start vectors' % len(VI_warm))
 
@@ -234,7 +239,6 @@ class IAFM(object):
         # used will be updated due to the regularization penalty. It's possible
         # that this is the cause for misleading validation scores. See discussion:
         # https://www.reddit.com/r/MachineLearning/comments/3y41si/
-        # V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
         V = Embedding(self.nb_vecs, self.vec_size, name='vecs', weights=[W])
 
         # Compute feature vector interactions. Return *batch* scalars.
@@ -279,13 +283,15 @@ class IAFM(object):
 
         # Instantiate callbacks and compile network.
         cb = [
-            VecReviewCallback(self.vi2feat, self.feat2cnt),
+            # VecReviewCallback(self.vi2feat, self.feat2cnt),
             AUCCallback(Xt, Xv, yt, yv, self.batch_size),
-            CSVLogger(self.history_path),
-            ModelCheckpoint(self.best_model_path, monitor=self.early_stop_metric, verbose=1,
-                            save_best_only=True, save_weights_only=True, mode='max'),
+            # CSVLogger(self.history_path),
+            # ModelCheckpoint(self.best_model_path.replace('.hdf5', '-%d-{val_auc:.3f}.hdf5' % int(time())),
+            #                 monitor=self.early_stop_metric, verbose=1, save_best_only=True, mode='max'),
             EarlyStopping(monitor=self.early_stop_metric, min_delta=self.early_stop_delta,
                           patience=self.early_stop_patience, verbose=1, mode='max'),
+            BadModelStopper()
+            # TensorBoard(log_dir='out', histogram_freq=1, batch_size=self.batch_size, write_grads=True)
         ]
         opt = self.optimizer(**self.optimizer_kwargs)
         net.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy', pos_avg, neg_avg])
@@ -293,9 +299,13 @@ class IAFM(object):
                           epochs=self.nb_epochs_max, verbose=1, callbacks=cb)
 
         i = np.argmax(history.history['val_auc'])
-        return history.history['val_loss'][i], history.history['val_auc'][i]
+        val_loss = history.history['val_loss'][i]
+        val_auc = history.history['val_auc'][i]
+        epochs = len(history.history['val_auc'])
+        return val_loss, val_auc, epochs
 
     def predict(self, X_keys):
+        self.logger.info('Predicting with weights from %s' % self.best_model_path)
         net = self.net()
         net.load_weights(self.best_model_path, by_name=True)
         X = self._keys_to_vector_indexes(X_keys)
@@ -539,7 +549,7 @@ class MultiVecRec(object):
         iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
         X = samples[['user', 'song']].values
         y = samples['target'].values
-        val_loss, val_auc = iafm.fit(X, X, y, y)
+        val_loss, val_auc, epochs = iafm.fit(X, X, y, y)
         self.logger.info('Best val_loss=%.4lf, val_auc=%.4lf' % (val_loss, val_auc))
         self.logger.info(str(IAFM_kwargs))
 
@@ -574,10 +584,12 @@ class MultiVecRec(object):
         self.logger.info('Cold-start songs = %d, %.3lf' % (n, n / len(Xv)))
 
         # Train.
-        val_loss, val_auc = iafm.fit(Xt, Xv, yt, yv)
+        val_loss, val_auc, epochs = iafm.fit(Xt, Xv, yt, yv)
 
+        # Print and return results.
         self.logger.info('Best val_loss=%.4lf, val_auc=%.4lf' % (val_loss, val_auc))
         self.logger.info(str(IAFM_kwargs))
+        return val_loss, val_auc, epochs
 
     def predict(self, samples, key2feats, IAFM_kwargs=IAFM_HYPERPARAMS_DEFAULT):
         iafm = IAFM(key2feats, self.best_model_path, self.history_path, **IAFM_kwargs)
@@ -587,6 +599,41 @@ class MultiVecRec(object):
         df.to_csv(self.predict_path, index=False)
         self.logger.info('Saved %s' % self.predict_path)
 
+    def hyperparam_search(self, samples, key2feats):
+
+        # New random number generator.
+        rng = np.random.RandomState(int(time()) % getpid())
+
+        while True:
+
+            # Copy original hyperparams then augment them.
+            hyperparams = IAFM_HYPERPARAMS_DEFAULT.copy()
+            hyperparams.update({
+                'vec_size': int(rng.choice(range(5, 100, 5))),
+                'vecs_init_kwargs': {
+                    'loc': 0.,
+                    'scale': float(rng.choice(np.linspace(0, 0.5, 11)))
+                },
+                'dropout_prop': float(rng.choice(np.linspace(0, 0.8, 9))),
+                'optimizer': rng.choice([Adagrad, SGD, Adadelta, RMSprop]),
+                'optimizer_kwargs': {
+                    'lr': float(rng.choice([1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1])),
+                    'decay': float(rng.choice([1e-5, 1e-4, 1e-3]))
+                },
+                'batch_size': int(rng.choice(range(5000, 75000, 5000))),
+                'nb_epochs_max': 60,
+            })
+
+            # Instantiate and train IAFM with the hyperparams.
+            val_loss, val_auc, epochs = self.val(samples, key2feats, hyperparams)
+
+            # Save file with the hyper params output.
+            p = '%s/hyperparams_search-%.4lf.txt' % (self.artifacts_dir, val_auc)
+            with open(p, 'w') as fp:
+                fp.write(pformat(hyperparams) + '\n')
+                fp.write('%d epochs\n' % epochs)
+                fp.close()
+
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
@@ -594,12 +641,14 @@ if __name__ == "__main__":
     ap.add_argument('--fit', action='store_true', default=False)
     ap.add_argument('--val', action='store_true', default=False)
     ap.add_argument('--predict', action='store_true', default=False)
+    ap.add_argument('--hyperparam_search', action='store_true', default=False)
+    ap.add_argument('--model_path', type=str, default=None, required=False)
     args = vars(ap.parse_args())
 
     model = MultiVecRec(
         data_dir='data',
         artifacts_dir='artifacts/multivecrec',
-        best_model_path='artifacts/multivecrec/model-iafm-best.hdf5',
+        best_model_path=args['model_path'] or 'artifacts/multivecrec/model-iafm.hdf5',
         history_path='artifacts/multivecrec/model-iafm-history.csv',
         predict_path='artifacts/multivecrec/predict_tst_%d.csv' % int(time())
     )
@@ -612,3 +661,6 @@ if __name__ == "__main__":
 
     if args['val']:
         model.val(*model.get_features(train=True))
+
+    if args['hyperparam_search']:
+        model.hyperparam_search(*model.get_features(train=True))
