@@ -6,7 +6,7 @@ from time import time
 from tqdm import tqdm
 import argparse
 import json
-import lightgbm as lgb
+import lightgbm as lgbm
 import logging
 import numpy as np
 import os
@@ -14,25 +14,88 @@ import pandas as pd
 import pdb
 import re
 
+GBDT_PARAMS_DEFAULT = {
 
-LGB_HYPERPARAMS = {
+    # Defining the task.
+    'application': 'binary',
     'objective': 'binary',
     'boosting': 'gbdt',
-    'learning_rate': 0.2,
-    'verbose': 0,
-    'num_leaves': 100,
-    'bagging_fraction': 0.95,
-    'bagging_freq': 1,
+    'metric': 'auc',
+    'train_metric': True,
+
+    # How many learners to fit, and how long to continue without
+    # improvement on the validation set.
+    'num_iterations': 500,
+    'early_stopping_rounds': 50,
+
+    # TODO: explain these parameters.
+    'learning_rate': 0.4,
+    'max_bin': 255,
+
+    # Constraints on the tree characteristics.
+    # Generally larger values will fit better but may over-fit.
+    'max_depth': 10,
+    'num_leaves': 64,
+
+    # Randomly select *bagging_fraction* of the data to fit a learner.
+    # Perform bagging at every *bagging_freq* iterations.
+    # Seed the random bagging with *bagging_seed*.
+    'bagging_fraction': 1.0,
+    'bagging_freq': 0,
     'bagging_seed': 1,
-    'feature_fraction': 0.9,
+
+    # Randomly select *feature_fraction* of the features to fit a learner.
+    # Seed the random selection with *feature_fraction_seed*.
+    'feature_fraction': 1.0,
     'feature_fraction_seed': 1,
-    'max_bin': 256,
-    'num_rounds': 100,
-    'metric': 'auc'
+
 }
 
 # Regular expressions and function for parsing musicians.
 RE_MUSICIANS_SPLIT_PATTERN = re.compile(r'feat(.)\w*|\(|\)|\||\/')
+
+
+def save_best_model(check_every_iterations, name, metric, mode, path):
+    metric_vals = []
+    improved_iterations = [-1]
+    cmpfunc = np.argmax if mode == 'max' else np.argmin
+
+    def callback(env):
+        for res in env.evaluation_result_list:
+            if res[0] == name and res[1] == metric:
+                metric_vals.append(res[2])
+        if env.iteration % check_every_iterations != 0:
+            return
+        check = cmpfunc(metric_vals)
+        if check > improved_iterations[-1]:
+            improved_iterations.append(check)
+            i = improved_iterations[-1]
+            p = path.format(name=name, metric=metric, val=metric_vals[i])
+            print('[%d] metric %s:%s improved: %.5lf on iteration %d. Saving model to %s.' %
+                  (env.iteration, name, metric, metric_vals[i], i, p))
+            env.model.save_model(p, env.iteration)
+        else:
+            print('[%d] metric %s:%s did not improve. Last improved on iteration %d' %
+                  (env.iteration, name, metric, improved_iterations[-1]))
+
+    callback.order = 99
+    return callback
+
+
+def print_feature_importance(print_every_iterations=10, importance_type='gain'):
+
+    def callback(env):
+        if env.iteration % print_every_iterations != 0:
+            return
+        names = env.model.feature_name()
+        ivals = env.model.feature_importance(importance_type)
+        print('[%d] feature importance' % env.iteration)
+        p = len('[%d]' % env.iteration)
+        for i in np.argsort(-1 * ivals):
+            print('%s %-20s %.3lf' % (' ' * p, names[i], ivals[i]))
+
+    callback.order = 99
+    return callback
 
 
 def parse_musicians(mstr):
@@ -274,54 +337,29 @@ class GBDTRec(object):
                     TST[c] = TST[c].astype('category')
             return TST
 
-    def val(self, data, val_prop=0.2, lgb_hyperparams=LGB_HYPERPARAMS):
+    def val(self, data, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
 
-        # Split data.
+        self.logger.info('Splitting dataset')
         nb_trn = int(len(data) * (1 - val_prop))
         data_trn, data_val = data.iloc[:nb_trn], data.iloc[nb_trn:]
         X_cols = [c for c in data.columns if c != 'target']
         X_trn, y_trn = data_trn[X_cols], data_trn['target']
         X_val, y_val = data_val[X_cols], data_val['target']
 
-        lgb_trn = lgb.Dataset(X_trn, y_trn)
-        lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_trn)
+        self.logger.info('Converting dataset to lgbm format')
+        gbdt_trn = lgbm.Dataset(X_trn, y_trn)
+        gbdt_val = lgbm.Dataset(X_val, y_val, reference=gbdt_trn)
 
-        params = {
-            'objective': 'binary',
-            'boosting': 'gbdt',
-            'learning_rate': 0.3,
-            'num_leaves': 108,
-            'bagging_fraction': 0.95,
-            'bagging_freq': 1,
-            'bagging_seed': 1,
-            'feature_fraction': 0.9,
-            'feature_fraction_seed': 1,
-            'max_bin': 256,
-            'max_depth': 10,
-            'num_boost_round': 1500,
-            'metric': 'auc'
-        }
+        self.logger.info('Training')
+        best_model_path = '%s/model-{name:s}-{metric:s}-{val:.2f}.txt' % self.artifacts_dir
+        gbdt_cb = [
+            save_best_model(10, 'val', 'auc', 'max', best_model_path),
+            print_feature_importance(10)
+        ]
+        gbdt = lgbm.train(
+            gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn, gbdt_val],
+            valid_names=['trn', 'val'], verbose_eval=10, callbacks=gbdt_cb)
 
-        model = lgb.train(params, train_set=lgb_trn,  valid_sets=lgb_val, verbose_eval=10)
-        pdb.set_trace()
-
-        # # LGB model with SKlearn API.
-        # lgb_hyperparams = {
-        #     'objective': 'binary',
-        #     'boosting_type': 'gbdt',
-        #     'num_leaves': 2,
-        #     'max_depth': -1,
-        #     'learning_rate': 0.1,
-        #     'n_estimators': 1,
-        #     'silent': False
-        # }
-        # gbdt = lgb.LGBMModel(**lgb_hyperparams)
-        # gbdt.fit(X_trn, y_trn, eval_set=(X_val, y_val), eval_metric='auc', verbose=True)
-
-    def fit(self, X=None, y=None, names=None, categ=None, lgb_hyperparams=LGB_HYPERPARAMS):
-        best_model_path = '%s/model-%d' % (self.artifacts_dir, int(time()))
-        lgbm = LGBMModel(**lgbm_hyperparams)
-        return
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
