@@ -1,6 +1,7 @@
 from collections import Counter
 from hashlib import md5
 from more_itertools import flatten
+from pprint import pformat
 from scipy.sparse import csr_matrix, save_npz, load_npz
 from time import time
 from tqdm import tqdm
@@ -25,7 +26,7 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 500,
+    'num_iterations': 475,
     'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
@@ -55,7 +56,7 @@ GBDT_PARAMS_DEFAULT = {
 RE_MUSICIANS_SPLIT_PATTERN = re.compile(r'feat(.)\w*|\(|\)|\||\/')
 
 
-def save_best_model(check_every_iterations, name, metric, mode, path):
+def save_best_model(check_every_iterations, name, metric, mode, model_path, params_path=None):
     metric_vals = []
     improved_iterations = [-1]
     cmpfunc = np.argmax if mode == 'max' else np.argmin
@@ -70,10 +71,18 @@ def save_best_model(check_every_iterations, name, metric, mode, path):
         if check > improved_iterations[-1]:
             improved_iterations.append(check)
             i = improved_iterations[-1]
-            p = path.format(name=name, metric=metric, val=metric_vals[i])
-            print('[%d] metric %s:%s improved: %.5lf on iteration %d. Saving model to %s.' %
+            p = model_path.format(name=name, metric=metric, val=metric_vals[i])
+            print('[%d] metric %s:%s improved: %.5lf on iteration %d. Saving model %s' %
                   (env.iteration, name, metric, metric_vals[i], i, p))
             env.model.save_model(p, env.iteration)
+            if params_path is None:
+                return
+            p = params_path.format(name=name, metric=metric, val=metric_vals[i])
+            print('[%d] saving params %s' % (env.iteration, p))
+            params_copy = env.params.copy()
+            params_copy.update({'num_iterations': int(improved_iterations[-1] + 1)})
+            with open(p, 'w') as fp:
+                json.dump(params_copy, fp, sort_keys=True, indent=1)
         else:
             print('[%d] metric %s:%s did not improve. Last improved on iteration %d' %
                   (env.iteration, name, metric, improved_iterations[-1]))
@@ -339,7 +348,7 @@ class GBDTRec(object):
 
     def val(self, data, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
 
-        self.logger.info('Splitting dataset')
+        self.logger.info('Preparing datasets')
         nb_trn = int(len(data) * (1 - val_prop))
         data_trn, data_val = data.iloc[:nb_trn], data.iloc[nb_trn:]
         X_cols = [c for c in data.columns if c != 'target']
@@ -351,14 +360,60 @@ class GBDTRec(object):
         gbdt_val = lgbm.Dataset(X_val, y_val, reference=gbdt_trn)
 
         self.logger.info('Training')
-        best_model_path = '%s/model-{name:s}-{metric:s}-{val:.2f}.txt' % self.artifacts_dir
+        model_path = '%s/model-{name:s}-{metric:s}-{val:.2f}.txt' % self.artifacts_dir
+        params_path = '%s/model-{name:s}-{metric:s}-{val:.2f}.json' % self.artifacts_dir
         gbdt_cb = [
-            save_best_model(10, 'val', 'auc', 'max', best_model_path),
+            save_best_model(10, 'val', 'auc', 'max', model_path, params_path),
             print_feature_importance(10)
         ]
         gbdt = lgbm.train(
             gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn, gbdt_val],
             valid_names=['trn', 'val'], verbose_eval=10, callbacks=gbdt_cb)
+
+    def fit(self, data, gbdt_params):
+
+        if type(gbdt_params) is str:
+            with open(gbdt_params) as fp:
+                gbdt_params = json.load(fp)
+        assert type(gbdt_params) is dict
+
+        self.logger.info('Preparing dataset')
+        X_cols = [c for c in data.columns if c != 'target']
+        gbdt_trn = lgbm.Dataset(data[X_cols], data['target'])
+
+        self.logger.info('Training')
+        self.logger.info('GBDT Params\n%s' % pformat(gbdt_params))
+        model_path = '%s/model-{name:s}-{metric:s}-{val:.2f}.txt' % self.artifacts_dir
+        gbdt_cb = [
+            save_best_model(10, 'trn', 'auc', 'max', model_path),
+            print_feature_importance(10)
+        ]
+        gbdt = lgbm.train(
+            gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn],
+            valid_names=['trn'], verbose_eval=10, callbacks=gbdt_cb)
+
+    def predict(self, data, gbdt_model, gbdt_params):
+
+        if type(gbdt_params) is str:
+            with open(gbdt_params) as fp:
+                gbdt_params = json.load(fp)
+        assert type(gbdt_params) is dict
+        self.logger.info('GBDT Params\n%s' % pformat(gbdt_params))
+
+        assert type(gbdt_model) is str
+        self.logger.info('Loading model from %s' % gbdt_model)
+        gbdt = lgbm.Booster(model_file=gbdt_model, silent=False)
+
+        self.logger.info('Preparing dataset')
+        X_cols = [c for c in data.columns if c not in {'id', 'target'}]
+
+        self.logger.info('Making predictions')
+        yp = gbdt.predict(data[X_cols], num_iteration=gbdt.current_iteration())
+        self.logger.info('Target mean = %.2lf' % yp.mean())
+        df = pd.DataFrame({'id': np.arange(len(yp)), 'target': yp})
+        submission_path = gbdt_model.replace('.txt', '-submission.csv')
+        df.to_csv(submission_path, index=False)
+        self.logger.info('Saved predictions %s' % submission_path)
 
 
 if __name__ == "__main__":
@@ -366,12 +421,20 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description='')
     ap.add_argument('--fit', action='store_true', default=False)
     ap.add_argument('--val', action='store_true', default=False)
+    ap.add_argument('--predict', action='store_true', default=False)
+    ap.add_argument('--params', type=str, default=None)
+    ap.add_argument('--model', type=str, default=None)
     args = vars(ap.parse_args())
 
     rec = GBDTRec(artifacts_dir='artifacts/gbdtrec')
 
     if args['fit']:
-        rec.fit(data=rec.get_features('train'))
+        rec.fit(data=rec.get_features('train'),
+                gbdt_params=args['params'] or GBDT_PARAMS_DEFAULT)
 
     if args['val']:
         rec.val(data=rec.get_features('train'))
+
+    if args['predict']:
+        rec.predict(data=rec.get_features('test'), gbdt_model=args['model'],
+                    gbdt_params=args['params'] or GBDT_PARAMS_DEFAULT)
