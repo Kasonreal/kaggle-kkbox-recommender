@@ -34,8 +34,8 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 100,
-    'early_stopping_rounds': 40,
+    'num_iterations': 450,
+    'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
     'learning_rate': 0.3,
@@ -242,12 +242,6 @@ class GBDTRec(object):
         S['artist_name'].replace('佚名', np.nan, inplace=True)
         S['lyricist'].replace('佚名', np.nan, inplace=True)
         S['composer'].replace('佚名', np.nan, inplace=True)
-
-        # Replace Chinese "Many Singers" 群星.
-        # https://www.kaggle.com/vinnsvinay/introduction-to-boosting-using-lgbm-lb-0-68357#245955
-        S['artist_name'].replace('群星', 'various artists', inplace=True)
-        S['lyricist'].replace('群星', 'various artists', inplace=True)
-        S['composer'].replace('群星', 'various artists', inplace=True)
 
         # Replace languages. 3,10,24,59 all correspond to Chinese.
         # https://www.kaggle.com/c/kkbox-music-recommendation-challenge/discussion/43645
