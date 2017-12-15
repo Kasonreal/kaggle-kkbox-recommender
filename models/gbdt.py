@@ -4,6 +4,7 @@ from itertools import product
 from more_itertools import flatten
 from pprint import pformat
 from scipy.sparse import csr_matrix, save_npz, load_npz
+from sklearn.preprocessing import LabelEncoder
 from time import time
 from tqdm import tqdm
 import argparse
@@ -17,7 +18,11 @@ import re
 
 import lightgbm as lgbm
 
-# from keras.optimizers import Adagrad
+from keras.engine.topology import Layer
+from keras.layers import Input, Embedding, Activation
+from keras.models import Model, load_model
+from keras.optimizers import Adagrad
+from keras import backend as K
 
 GBDT_PARAMS_DEFAULT = {
 
@@ -30,7 +35,7 @@ GBDT_PARAMS_DEFAULT = {
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
     'num_iterations': 1000,
-    'early_stopping_rounds': 50,
+    'early_stopping_rounds': 100,
 
     # TODO: explain these parameters.
     'learning_rate': 0.3,
@@ -56,11 +61,12 @@ GBDT_PARAMS_DEFAULT = {
 }
 
 INTERACTION_SPACE_PARAMS_DEFAULT = {
-    'vec_size': 50,
+    'nb_vecs': -1,
+    'nb_dims': 50,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.05},
-    # 'optimizer': Adagrad,
-    'optimizer_kwargs': {'lr': 0.01},
+    'optimizer': Adagrad,
+    'optimizer_kwargs': {'lr': 0.05},
     'nb_epochs_max': 10,
     'batch_size': 50000
 }
@@ -112,7 +118,7 @@ def print_feature_importance(print_every_iterations=10, importance_type='gain'):
         print('[%d] feature importance' % env.iteration)
         p = len('[%d]' % env.iteration)
         for i in np.argsort(-1 * ivals):
-            print('%s %-20s %.3lf' % (' ' * p, names[i], ivals[i]))
+            print('%s %-52s %.3lf' % (' ' * p, names[i], ivals[i]))
 
     callback.order = 99
     return callback
@@ -148,7 +154,25 @@ def parse_isrc_year(isrc):
 
 
 def round_to_nearest(n, r):
-    return round(n / r) * r
+    return int(round(n / r) * r)
+
+
+def encoder(series, v2i=None):
+    """Encode a series to the smallest possible numerical type"""
+    v2i = v2i or {np.nan: -1}
+    dtypes = [np.int8, np.int16, np.int32, np.int64]
+    n = len(series.unique())
+    for dtype in dtypes:
+        if n < np.iinfo(dtype).max:
+            break
+    encoded = np.empty(len(series), dtype=dtype)
+    for si, v in enumerate(series.values):
+        i = v2i.get(v)
+        if i is None:
+            i = len(v2i)
+            v2i[v] = i
+        encoded[si] = i
+    return encoded
 
 
 class GBDTRec(object):
@@ -160,37 +184,40 @@ class GBDTRec(object):
         self.data_dir = data_dir
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def _get_base_features(self, feats_cmb):
+    def _get_base_features(self, feats):
 
-        # Rename user and song ids for consistency.
-        # Others will be renamed later.
-        feats_cmb.rename({'msno': 'user_id_cat', 'song_id': 'song_id_cat'},
-                         axis='columns', inplace=True)
+        # Rename and encode user and song ids.
+        feats['user_id_cat'] = encoder(feats['msno'])
+        feats['song_id_cat'] = encoder(feats['song_id'])
+        feats.drop('msno', axis=1, inplace=True)
+        feats.drop('song_id', axis=1, inplace=True)
 
         #########
         # USERS #
         #########
 
         # Get unique users and transform them.
-        user_cols = ['user_id_cat', 'bd', 'city', 'gender', 'registration_init_time']
-        U = feats_cmb[user_cols].drop_duplicates('user_id_cat')
+        cols_user = ['user_id_cat', 'bd', 'city', 'gender', 'registration_init_time']
+        U = feats[cols_user].drop_duplicates('user_id_cat')
         self.logger.info('Transforming %d unique users' % len(U))
 
-        # Clip the ages at a reasonable value and rename. Replace unreasonable
-        # values with NaNs.
+        # Clip ages and replace unreasonable values with np.nan.
         fix_age = lambda x: min(max(x, 10), 60) if 10 <= x <= 60 else np.nan
-        U['bd'] = U['bd'].apply(fix_age)
-        U.rename({'bd': 'user_age_con'}, axis='columns', inplace=True)
+        U['user_age_con'] = U['bd'].apply(fix_age)
+        U.drop('bd', axis=1, inplace=True)
 
-        # Keep city as-is and rename.
-        U.rename({'city': 'user_city_cat'}, axis='columns', inplace=True)
+        # Rename and encode cities.
+        U['user_city_cat'] = encoder(U['city'])
+        U.drop('city', axis=1, inplace=True)
 
-        # Gender has missing values which are nan. Just rename it.
-        U.rename({'gender': 'user_gender_cat'}, axis='columns', inplace=True)
+        # Rename and encode gender.
+        U['user_gender_cat'] = encoder(U['gender'])
+        U.drop('gender', axis=1, inplace=True)
 
         # Extract the registration year.
         get_year = lambda t: int(str(t)[:4])
         U['user_regyear_con'] = U['registration_init_time'].apply(get_year)
+        U['user_regyear_con'] = U['user_regyear_con'].astype(np.uint16)
 
         # Keep only the new columns.
         U = U[['user_id_cat', 'user_age_con', 'user_city_cat',
@@ -201,10 +228,9 @@ class GBDTRec(object):
         #########
 
         # Get unique songs and transform them.
-        song_cols = ['song_id_cat', 'artist_name', 'composer', 'genre_ids', 'isrc',
+        cols_song = ['song_id_cat', 'artist_name', 'composer', 'genre_ids', 'isrc',
                      'language', 'lyricist', 'song_length']
-        song_hash_cols = list(set(song_cols) - {'song_id_cat'})
-        S = feats_cmb[song_cols].drop_duplicates('song_id_cat')
+        S = feats[cols_song].drop_duplicates('song_id_cat')
         self.logger.info('Transforming %d unique songs' % len(S))
 
         # Replace unknown artists, lyricists, composers. '佚名' means missing names.
@@ -212,6 +238,12 @@ class GBDTRec(object):
         S['artist_name'].replace('佚名', np.nan, inplace=True)
         S['lyricist'].replace('佚名', np.nan, inplace=True)
         S['composer'].replace('佚名', np.nan, inplace=True)
+
+        # Replace Chinese "Many Singers" 群星.
+        # https://www.kaggle.com/vinnsvinay/introduction-to-boosting-using-lgbm-lb-0-68357#245955
+        S['artist_name'].replace('群星', 'various artists', inplace=True)
+        S['lyricist'].replace('群星', 'various artists', inplace=True)
+        S['composer'].replace('群星', 'various artists', inplace=True)
 
         # Replace languages. 3,10,24,59 all correspond to Chinese.
         # https://www.kaggle.com/c/kkbox-music-recommendation-challenge/discussion/43645
@@ -221,29 +253,28 @@ class GBDTRec(object):
 
         # Replace negative language value with positive.
         S['language'].replace(-1, 1, inplace=True)
+        S['song_language_cat'] = encoder(S['language'])
 
         # Compute song hashes. Later these will replace the song IDs.
         self.logger.info('Hashing songs')
+        song_hash_cols = list(set(cols_song) - {'song_id_cat'})
         get_hash = lambda row: md5(str(row.values.tolist()).encode()).hexdigest()
-        S['song_hash_cat'] = S[song_hash_cols].apply(get_hash, axis=1)
+        S['song_hash_cat'] = encoder(S[song_hash_cols].apply(get_hash, axis=1))
 
         # Leave song length as is and rename.
-        S.rename({'song_length': 'song_len_con'}, axis='columns', inplace=True)
-        pdb.set_trace()
+        S['song_len_con'] = S['song_length']
+        S.drop('song_length', axis=1, inplace=True)
 
         # Extract song country and year from ISRC.
         get_country = lambda x: x[:2] if type(x) is str else np.nan
         S['song_country_cat'] = S['isrc'].apply(get_country)
         S['song_year_con'] = S['isrc'].apply(parse_isrc_year)
 
-        # Leave song language as is and rename.
-        S.rename({'language': 'song_language_cat'}, axis='columns', inplace=True)
-
         # Parse and count musicians and genres. Pick the most common one for each row.
         self.logger.info('Parsing, counting musicians and genres')
         song_id_2_musicians = {}
         song_id_2_genres = {}
-        song_id_counter = Counter(feats_cmb['song_id_cat'].values)
+        song_id_counter = Counter(feats['song_id_cat'].values)
         musicians_counter = Counter()
         genres_counter = Counter()
         for i, row in S.iterrows():
@@ -278,6 +309,7 @@ class GBDTRec(object):
 
         S['song_musician_cat'] = musicians
         S['song_genre_cat'] = genres
+        S['song_genre_cat'] = encoder(S['song_genre_cat'])
 
         # Keep only the new columns.
         S = S[['song_id_cat', 'song_hash_cat', 'song_len_con', 'song_country_cat',
@@ -287,87 +319,133 @@ class GBDTRec(object):
         # CONTEXT #
         ###########
 
-        # Clean up context variables.
-        feats_cmb['source_screen_name'].replace('Unknown', np.nan, inplace=True)
-        feats_cmb['source_system_tab'].replace('null', np.nan, inplace=True)
-        feats_cmb.rename({'source_screen_name': 'ctxt_scr_cat',
-                          'source_system_tab': 'ctxt_tab_cat',
-                          'source_type': 'ctxt_type_cat'},
-                         axis='columns', inplace=True)
+        # Clean up and encode context variables.
+        feats['source_screen_name'].replace('Unknown', np.nan, inplace=True)
+        feats['source_system_tab'].replace('null', np.nan, inplace=True)
+        feats['ctxt_scr_cat'] = encoder(feats['source_screen_name'])
+        feats['ctxt_tab_cat'] = encoder(feats['source_system_tab'])
+        feats['ctxt_type_cat'] = encoder(feats['source_type'])
+        feats.drop('source_screen_name', axis=1, inplace=True)
+        feats.drop('source_system_tab', axis=1, inplace=True)
+        feats.drop('source_type', axis=1, inplace=True)
 
         # Keep subset of columns.
-        feats_cmb = feats_cmb[['user_id_cat', 'song_id_cat', 'ctxt_scr_cat', 'ctxt_tab_cat',
-                               'ctxt_type_cat', 'target']]
+        feats = feats[['user_id_cat', 'song_id_cat', 'ctxt_scr_cat', 'ctxt_tab_cat',
+                       'ctxt_type_cat', 'target']]
 
         ###########
         # MERGING #
         ###########
 
-        # Left join feats_cmb with the users and songs.
-        feats_cmb = feats_cmb.merge(U, on='user_id_cat', how='left')
-        feats_cmb = feats_cmb.merge(S, on='song_id_cat', how='left')
+        # Left join feats with the users and songs.
+        feats = feats.merge(U, on='user_id_cat', how='left')
+        feats = feats.merge(S, on='song_id_cat', how='left')
 
         # Replace the song id with song hash.
-        feats_cmb['song_id_cat'] = feats_cmb['song_hash_cat']
-        feats_cmb.drop('song_hash_cat', inplace=True, axis=1)
-        return feats_cmb
+        feats['song_id_cat'] = feats['song_hash_cat']
+        return feats.drop('song_hash_cat', axis=1)
 
     def _get_interaction_features(self, feats_base):
 
+        # Count training and testing rows.
+        nb_trn = len(feats_base) - sum(feats_base['target'].isnull())
+        nb_tst = len(feats_base) - nb_trn
+
+        # Make a copy of feats_base for manipulation.
+        cols_user = [c for c in feats_base.columns if c.startswith('user_')]
+        cols_song = [c for c in feats_base.columns if c.startswith('song_')]
+        feats_intr = feats_base[cols_user + cols_song + ['target']].copy()
+
         self.logger.info('Discretizing continuous features')
-        feats_intr = feats_base.copy()
-        feats_intr = feats_intr[['user_id_cat', 'song_id_cat', 'song_musician_cat', 'song_genre_cat']]
+        round_age = lambda x: x if np.isnan(x) else round_to_nearest(x, 3)
+        feats_intr['user_age_cat'] = feats_intr['user_age_con'].apply(round_age)
+        feats_intr.drop('user_age_con', axis=1, inplace=True)
 
-        # round_age = lambda x: x if np.isnan(x) else round_to_nearest(x, 3)
-        # feats_intr['user_age_cat'] = feats_intr['user_age_con'].apply(round_age).astype('category')
-        # feats_intr.drop('user_age_con', axis=1, inplace=True)
+        round_len = lambda x: x if np.isnan(x) else int(round(np.log(x)))
+        feats_intr['song_len_cat'] = feats_intr['song_len_con'].apply(round_len)
+        feats_intr.drop('song_len_con', axis=1, inplace=True)
 
-        # round_year = lambda x: x if np.isnan(x) else round_to_nearest(x, 3)
-        # feats_intr['user_regyear_cat'] = feats_intr['user_regyear_con'].apply(round_year).astype('category')
-        # feats_intr.drop('user_regyear_con', axis=1, inplace=True)
+        round_year = lambda x: x if np.isnan(x) else round_to_nearest(x, 3)
+        feats_intr['user_regyear_cat'] = feats_intr['user_regyear_con'].apply(round_year)
+        feats_intr.drop('user_regyear_con', axis=1, inplace=True)
 
-        # feats_intr['song_len_cat'] = np.log(feats_intr['song_len_con']).round().astype('category')
-        # feats_intr.drop('song_len_con', axis=1, inplace=True)
+        feats_intr['song_year_cat'] = feats_intr['song_year_con'].apply(round_year)
+        feats_intr.drop('song_year_con', axis=1, inplace=True)
 
-        # Encode all possible features into a term<->index vocabulary.
-        # nan (missing) is encoded as index 0.
-        feat_terms_all = set()
+        # Replace missing values with a common token.
+        MISSING = '_UNK_'
+        feats_intr.fillna(MISSING, inplace=True)
+
+        self.logger.info('Encoding unique feature values')
+        feats_lookup, nb_feats = {}, 1
         for c in feats_intr.columns:
-            set_prefix = lambda v: '%s::%s' % (c, str(v))
-            feat_terms_new = map(set_prefix, feats_intr[c].unique().tolist())
-            feat_terms_all = feat_terms_all.union(feat_terms_new)
+            feats_lookup[c] = {f: nb_feats + i for i, f in enumerate(feats_intr[c].unique())}
+            feats_lookup[MISSING] = 0
+            nb_feats += len(feats_lookup[c])
 
-        self.logger.info('Found %d unique feature terms' % len(feat_terms_all))
+        self.logger.info('Found %d unique feature values' % nb_feats)
 
-        pdb.set_trace()
-
-        # Get the interaction product of user and song columns.
+        # Compute product of all user and song columns.
         cols_user = [c for c in feats_intr.columns if c.startswith('user_')]
         cols_song = [c for c in feats_intr.columns if c.startswith('song_')]
         cols_prod = list(product(cols_user, cols_song))
 
-        pdb.set_trace()
+        # Populate training and test index pairs and the training targets.
+        X_trn = np.empty((nb_trn * len(cols_prod), 2), dtype=np.uint32)
+        X_tst = np.empty((nb_tst * len(cols_prod), 2), dtype=np.uint32)
+        y_trn = np.empty((nb_trn * len(cols_prod),), dtype=np.uint8)
 
-        # Expand the rows into index pairs with a target.
+        self.logger.info('Training interactions: %d (%.3lf GB)' % (X_trn.shape[0], X_trn.nbytes / 10e8))
+        self.logger.info('Testing  interactions: %d (%.3lf GB)' % (X_tst.shape[0], X_tst.nbytes / 10e8))
+
+        for pi, (c0, c1) in enumerate(cols_prod):
+            self.logger.info('Populating interaction %d of %d: (%s, %s)' % (pi, len(cols_prod), c0, c1))
+
+            # Indexing into the matrix being populated.
+            i0_trn = pi * nb_trn
+            i0_tst = pi * nb_tst
+
+            # Apply prefixes to the first column and then translate to indexes.
+            X_ = feats_intr[c0].apply(feats_lookup[c0].get)
+            X_trn[i0_trn:i0_trn + nb_trn, 0] = X_[:nb_trn]
+            X_tst[i0_tst:i0_tst + nb_tst, 0] = X_[nb_trn:]
+
+            # Apply prefixes to the second column, then translate to indexes.
+            X_ = feats_intr[c1].apply(feats_lookup[c1].get)
+            X_trn[i0_trn:i0_trn + nb_trn, 1] = X_[:nb_trn]
+            X_tst[i0_tst:i0_tst + nb_tst, 1] = X_[nb_trn:]
+
+            # Copy over the targets.
+            y_trn[i0_trn:i0_trn + nb_trn] = feats_intr['target'].iloc[:nb_trn].values
 
         # Initialize and fit the vector space model.
+        self.interaction_space_params.update({'nb_vecs': nb_feats})
+        model = InteractionSpaceModel(**self.interaction_space_params)
+        model.fit(X_trn, y_trn)
+        yp_trn = model.transform(X_trn).astype(np.float16)
+        yp_tst = model.transform(X_tst).astype(np.float16)
 
-        # Store the pairwise similarities as features.
+        # Append the pairwise cosine similarities as columns in feats_base.
+        for pi, (c0, c1) in enumerate(cols_prod):
+            c = 'sim_%s_%s_con' % (c0, c1)
+            self.logger.info('Populating column %s' % c)
+            i0_trn = pi * nb_trn
+            i0_tst = pi * nb_tst
+            feats_base[c] = np.concatenate([
+                yp_trn[i0_trn:i0_trn + nb_trn],
+                yp_tst[i0_tst:i0_tst + nb_tst]
+            ])
 
-        pdb.set_trace()
+        return feats_base
 
     def get_features(self, which='train'):
 
         assert which in {'train', 'test'}
-        TRN = TST = None
-
-        # FIXME: should be just feats-base.csv..
-        path_feats_base = '%s/feats-base-trn.csv' % self.artifacts_dir
+        feats_intr = None
+        path_feats_base = '%s/feats-base.csv' % self.artifacts_dir
         path_feats_intr = '%s/feats-interactions.csv' % self.artifacts_dir
-        path_model_intr = '%s/model-interaction-space.hdf5' % self.artifacts_dir
-
         ready_feats_base = os.path.exists(path_feats_base)
-        ready_feats_intr = os.path.exists(path_feats_intr) and os.path.exists(path_model_intr)
+        ready_feats_intr = os.path.exists(path_feats_intr)
 
         if not ready_feats_base:
             t0 = time()
@@ -387,41 +465,37 @@ class GBDTRec(object):
             feats_tst = feats_tst.merge(feats_sei, on='song_id', how='left')
 
             self.logger.info('Combining feats_trn and feats_tst')
-            feats_cmb = feats_trn.append(feats_tst, ignore_index=True)
+            feats = feats_trn.append(feats_tst, ignore_index=True)
 
             # Save some memory.
             del feats_sng, feats_sei, feats_mmb, feats_trn, feats_tst
 
             # Encode test and train rows at the same time.
             self.logger.info('Engineering base features')
-            feats_base = self._get_base_features(feats_cmb)
+            feats_base = self._get_base_features(feats)
             feats_base.to_csv(path_feats_base, index=False)
             self.logger.info('Completed in %d seconds' % (time() - t0))
 
         if not ready_feats_intr:
+            t0 = time()
             self.logger.info('Engineering interaction features')
-            feats_base = pd.read_csv(path_feats_base, nrows=500000)
+            feats_base = pd.read_csv(path_feats_base)
             feats_intr = self._get_interaction_features(feats_base)
+            feats_intr.to_csv(path_feats_intr, index=False)
+            self.logger.info('Completed in %d seconds' % (time() - t0))
 
-            # ispace = InteractionSpace(**self.interaction_space_params)
+        if feats_intr == None:
+            feats_intr = pd.read_csv(path_feats_intr)
 
-        # TODO: compute interaction features and add them to the base features.
+        for c in feats_intr.columns:
+            if c.endswith('_cat'):
+                feats_intr[c] = feats_intr[c].astype('category')
+        nb_trn = len(feats_intr) - sum(feats_intr['target'].isnull())
 
         if which == 'train':
-            if TRN is None:
-                TRN = pd.read_csv(path_base_trn, nrows=100000)
-            for c in TRN.columns:
-                if c.endswith('_cat'):
-                    TRN[c] = TRN[c].astype('category')
-            return TRN
-
+            return feats_intr.iloc[:nb_trn]
         elif which == 'test':
-            if TST is None:
-                TST = pd.read_csv(path_base_tst)
-            for c in TST.columns:
-                if c.endswith('_cat'):
-                    TST[c] = TST[c].astype('category')
-            return TST
+            return feats_intr.iloc[nb_trn:]
 
     def val(self, data, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
 
@@ -493,19 +567,63 @@ class GBDTRec(object):
         self.logger.info('Saved predictions %s' % submission_path)
 
 
-class InteractionSpace(object):
+class MaskedVecDot(Layer):
 
-    def __init__(self, df1, df2, model_path):
+    def __init__(self, **kwargs):
+        super(MaskedVecDot, self).__init__(**kwargs)
 
-        return
+    def build(self, input_shape):
+        pass
 
-    def fit(self):
+    def call(self, inputs):
+        VI_0, VI_1, V_0, V_1 = inputs
+        V_dot = K.sum(V_0 * V_1, axis=-1)
+        return V_dot * K.clip(VI_0 * VI_1, 0, 1)
 
-        return
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
 
-    def eval(self):
 
-        return
+class InteractionSpaceModel(object):
+
+    def __init__(self, nb_dims, nb_vecs, vecs_init_func, vecs_init_kwargs,
+                 optimizer, optimizer_kwargs, batch_size, nb_epochs_max):
+        self.nb_dims = nb_dims
+        self.nb_vecs = nb_vecs
+        self.vecs_init_func = vecs_init_func
+        self.vecs_init_kwargs = vecs_init_kwargs
+        self.optimizer = optimizer
+        self.optimizer_kwargs = optimizer_kwargs
+        self.batch_size = batch_size
+        self.nb_epochs_max = nb_epochs_max
+        self.net = self._get_net()
+
+    def _get_net(self):
+        # Define, initialize vector space.
+        self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.nb_dims)})
+        Vw = self.vecs_init_func(**self.vecs_init_kwargs)
+        Vw[0] *= 0
+        V = Embedding(self.nb_vecs, self.nb_dims, name='vecs', weights=[Vw])
+
+        # Inputs and vector dot product.
+        VI_0, VI_1 = Input((1,)), Input((1,))
+        V_0, V_1 = V(VI_0), V(VI_1)
+        V_dot = MaskedVecDot()([VI_0, VI_1, V_0, V_1])
+
+        # Apply sigmoid activation for pseudo-classification.
+        clsf = Activation('sigmoid')(V_dot)
+
+        # Model with two inputs, out output.
+        return Model([VI_0, VI_1], clsf)
+
+    def fit(self, X, y):
+        opt = self.optimizer(**self.optimizer_kwargs)
+        self.net.compile(opt, loss='binary_crossentropy', metrics=['accuracy'])
+        self.net.fit([X[:, 0], X[:, 1]], y, batch_size=self.batch_size,
+                     epochs=self.nb_epochs_max)
+
+    def transform(self, X):
+        return self.net.predict([X[:, 0], X[:, 1]], batch_size=self.batch_size, verbose=True)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
