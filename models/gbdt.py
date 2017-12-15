@@ -4,7 +4,7 @@ from itertools import product
 from more_itertools import flatten
 from pprint import pformat
 from scipy.sparse import csr_matrix, save_npz, load_npz
-from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 from time import time
 from tqdm import tqdm
 import argparse
@@ -34,8 +34,8 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 1000,
-    'early_stopping_rounds': 100,
+    'num_iterations': 100,
+    'early_stopping_rounds': 40,
 
     # TODO: explain these parameters.
     'learning_rate': 0.3,
@@ -219,9 +219,13 @@ class GBDTRec(object):
         U['user_regyear_con'] = U['registration_init_time'].apply(get_year)
         U['user_regyear_con'] = U['user_regyear_con'].astype(np.uint16)
 
+        # Count user plays.
+        user_id_counter = Counter(feats['user_id_cat'].values)
+        U['user_plays_con'] = U['user_id_cat'].apply(user_id_counter.get)
+
         # Keep only the new columns.
         U = U[['user_id_cat', 'user_age_con', 'user_city_cat',
-               'user_gender_cat', 'user_regyear_con']]
+               'user_gender_cat', 'user_regyear_con', 'user_plays_con']]
 
         #########
         # SONGS #
@@ -270,6 +274,14 @@ class GBDTRec(object):
         S['song_country_cat'] = S['isrc'].apply(get_country)
         S['song_year_con'] = S['isrc'].apply(parse_isrc_year)
 
+        # Keep and rename the raw musicians.
+        S.rename({
+            'artist_name': 'song_artist_raw_cat',
+            'composer': 'song_composer_raw_cat',
+            'lyricist': 'song_lyricist_raw_cat',
+            'genre_ids': 'song_genres_raw_cat'},
+            axis='columns', inplace=True)
+
         # Parse and count musicians and genres. Pick the most common one for each row.
         self.logger.info('Parsing, counting musicians and genres')
         song_id_2_musicians = {}
@@ -279,18 +291,18 @@ class GBDTRec(object):
         genres_counter = Counter()
         for i, row in S.iterrows():
             song_count = song_id_counter[row['song_id_cat']]
-            mm = parse_musicians(row['artist_name'])
-            mm += parse_musicians(row['lyricist'])
-            mm += parse_musicians(row['composer'])
+            mm = parse_musicians(row['song_artist_raw_cat'])
+            mm += parse_musicians(row['song_composer_raw_cat'])
+            mm += parse_musicians(row['song_lyricist_raw_cat'])
             mm = list(set(mm))
             song_id_2_musicians[row['song_id_cat']] = mm
             musicians_counter.update(mm * song_count)
-            gg = parse_genres(row['genre_ids'])
+            gg = parse_genres(row['song_genres_raw_cat'])
             song_id_2_genres[row['song_id_cat']] = gg
             genres_counter.update(gg * song_count)
 
-        self.logger.info('Frequent musicians: %s' % str(musicians_counter.most_common()[:5]))
-        self.logger.info('Frequent genres: %s' % str(genres_counter.most_common()[:5]))
+        self.logger.info('Frequent musicians: %s' % str(musicians_counter.most_common()[:10]))
+        self.logger.info('Frequent genres: %s' % str(genres_counter.most_common()[:10]))
         self.logger.info('Replacing musicians and genres')
         musicians, genres = [], []
         for k in S['song_id_cat'].values:
@@ -309,11 +321,19 @@ class GBDTRec(object):
 
         S['song_musician_cat'] = musicians
         S['song_genre_cat'] = genres
-        S['song_genre_cat'] = encoder(S['song_genre_cat'])
+        S['song_genre_cat'] = S['song_genre_cat']
+
+        # Count song, musician, genre plays.
+        S['song_id_plays_con'] = S['song_id_cat'].apply(song_id_counter.get)
+        S['song_musician_plays_con'] = S['song_musician_cat'].apply(musicians_counter.get)
+        S['song_genre_plays_con'] = S['song_genre_cat'].apply(genres_counter.get)
 
         # Keep only the new columns.
         S = S[['song_id_cat', 'song_hash_cat', 'song_len_con', 'song_country_cat',
-               'song_year_con', 'song_musician_cat', 'song_genre_cat', 'song_language_cat']]
+               'song_year_con', 'song_musician_cat', 'song_genre_cat', 'song_language_cat',
+               'song_artist_raw_cat', 'song_lyricist_raw_cat', 'song_composer_raw_cat',
+               'song_genres_raw_cat', 'song_id_plays_con', 'song_musician_plays_con',
+               'song_genre_plays_con']]
 
         ###########
         # CONTEXT #
@@ -441,7 +461,7 @@ class GBDTRec(object):
     def get_features(self, which='train'):
 
         assert which in {'train', 'test'}
-        feats_intr = None
+        feats_intr, feats_base = None, None
         path_feats_base = '%s/feats-base.csv' % self.artifacts_dir
         path_feats_intr = '%s/feats-interactions.csv' % self.artifacts_dir
         ready_feats_base = os.path.exists(path_feats_base)
@@ -476,35 +496,44 @@ class GBDTRec(object):
             feats_base.to_csv(path_feats_base, index=False)
             self.logger.info('Completed in %d seconds' % (time() - t0))
 
-        if not ready_feats_intr:
-            t0 = time()
-            self.logger.info('Engineering interaction features')
+        # if not ready_feats_intr:
+        #     t0 = time()
+        #     self.logger.info('Engineering interaction features')
+        #     feats_base = pd.read_csv(path_feats_base)
+        #     feats_intr = self._get_interaction_features(feats_base)
+        #     feats_intr.to_csv(path_feats_intr, index=False)
+        #     self.logger.info('Completed in %d seconds' % (time() - t0))
+
+        # if feats_intr == None:
+        #     feats_intr = pd.read_csv(path_feats_intr)
+
+        # for c in feats_intr.columns:
+        #     if c.endswith('_cat'):
+        #         feats_intr[c] = feats_intr[c].astype('category')
+        # nb_trn = len(feats_intr) - sum(feats_intr['target'].isnull())
+
+        # if which == 'train':
+        #     return feats_intr.iloc[:nb_trn]
+        # elif which == 'test':
+        #     return feats_intr.iloc[nb_trn:]
+
+        if feats_base is None:
             feats_base = pd.read_csv(path_feats_base)
-            feats_intr = self._get_interaction_features(feats_base)
-            feats_intr.to_csv(path_feats_intr, index=False)
-            self.logger.info('Completed in %d seconds' % (time() - t0))
-
-        if feats_intr == None:
-            feats_intr = pd.read_csv(path_feats_intr)
-
-        for c in feats_intr.columns:
+        for c in feats_base.columns:
             if c.endswith('_cat'):
-                feats_intr[c] = feats_intr[c].astype('category')
-        nb_trn = len(feats_intr) - sum(feats_intr['target'].isnull())
+                feats_base[c] = feats_base[c].astype('category')
+        nb_trn = len(feats_base) - sum(feats_base['target'].isnull())
+        X, y = feats_base.drop('target', axis=1), feats_base['target']
 
         if which == 'train':
-            return feats_intr.iloc[:nb_trn]
+            return X.iloc[:nb_trn], y.iloc[:nb_trn]
         elif which == 'test':
-            return feats_intr.iloc[nb_trn:]
+            return X.iloc[nb_trn:]
 
-    def val(self, data, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
+    def val(self, X, y, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
 
         self.logger.info('Preparing datasets')
-        nb_trn = int(len(data) * (1 - val_prop))
-        data_trn, data_val = data.iloc[:nb_trn], data.iloc[nb_trn:]
-        X_cols = [c for c in data.columns if c != 'target']
-        X_trn, y_trn = data_trn[X_cols], data_trn['target']
-        X_val, y_val = data_val[X_cols], data_val['target']
+        X_trn, X_val, y_trn, y_val = train_test_split(X, y, test_size=val_prop, shuffle=False)
 
         self.logger.info('Converting dataset to lgbm format')
         gbdt_trn = lgbm.Dataset(X_trn, y_trn)
@@ -521,7 +550,7 @@ class GBDTRec(object):
             gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn, gbdt_val],
             valid_names=['trn', 'val'], verbose_eval=10, callbacks=gbdt_cb)
 
-    def fit(self, data, gbdt_params):
+    def fit(self, X, y, gbdt_params):
 
         if type(gbdt_params) is str:
             with open(gbdt_params) as fp:
@@ -529,8 +558,7 @@ class GBDTRec(object):
         assert type(gbdt_params) is dict
 
         self.logger.info('Preparing dataset')
-        X_cols = [c for c in data.columns if c != 'target']
-        gbdt_trn = lgbm.Dataset(data[X_cols], data['target'])
+        gbdt_trn = lgbm.Dataset(X, y)
 
         self.logger.info('Training')
         self.logger.info('GBDT Params\n%s' % pformat(gbdt_params))
@@ -543,7 +571,7 @@ class GBDTRec(object):
             gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn],
             valid_names=['trn'], verbose_eval=10, callbacks=gbdt_cb)
 
-    def predict(self, data, gbdt_model, gbdt_params):
+    def predict(self, X, gbdt_model, gbdt_params):
 
         if type(gbdt_params) is str:
             with open(gbdt_params) as fp:
@@ -555,11 +583,8 @@ class GBDTRec(object):
         self.logger.info('Loading model from %s' % gbdt_model)
         gbdt = lgbm.Booster(model_file=gbdt_model, silent=False)
 
-        self.logger.info('Preparing dataset')
-        X_cols = [c for c in data.columns if c not in {'id', 'target'}]
-
         self.logger.info('Making predictions')
-        yp = gbdt.predict(data[X_cols], num_iteration=gbdt.current_iteration())
+        yp = gbdt.predict(X, num_iteration=gbdt.current_iteration())
         self.logger.info('Target mean = %.2lf' % yp.mean())
         df = pd.DataFrame({'id': np.arange(len(yp)), 'target': yp})
         submission_path = gbdt_model.replace('.txt', '-submission.csv')
@@ -638,12 +663,13 @@ if __name__ == "__main__":
     rec = GBDTRec(artifacts_dir='artifacts/gbdtrec')
 
     if args['fit']:
-        rec.fit(data=rec.get_features('train'),
+        rec.fit(*rec.get_features('train'),
                 gbdt_params=args['params'] or GBDT_PARAMS_DEFAULT)
 
     if args['val']:
-        rec.val(data=rec.get_features('train'))
+        rec.val(*rec.get_features('train'))
 
     if args['predict']:
-        rec.predict(data=rec.get_features('test'), gbdt_model=args['model'],
+        rec.predict(X=rec.get_features('test'),
+                    gbdt_model=args['model'],
                     gbdt_params=args['params'] or GBDT_PARAMS_DEFAULT)
