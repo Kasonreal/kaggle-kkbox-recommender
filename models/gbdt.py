@@ -35,17 +35,17 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 560,
+    'num_iterations': 1350,
     'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
-    'learning_rate': 0.2,
+    'learning_rate': 0.1,
     'max_bin': 255,
 
     # Constraints on the tree characteristics.
     # Generally larger values will fit better but may over-fit.
     'max_depth': 10,
-    'num_leaves': 150,
+    'num_leaves': 110,
 
     # Randomly select *bagging_fraction* of the data to fit a learner.
     # Perform bagging at every *bagging_freq* iterations.
@@ -249,10 +249,9 @@ class GBDTRec(object):
         S['language'].replace(10, 3, inplace=True)
         S['language'].replace(24, 3, inplace=True)
         S['language'].replace(59, 3, inplace=True)
+        S['song_language_cat'] = encoder(S['language'])
 
         # Replace negative language value with positive.
-        S['language'].replace(-1, 1, inplace=True)
-        S['song_language_cat'] = encoder(S['language'])
 
         # Compute song hashes. Later these will replace the song IDs.
         self.logger.info('Hashing songs')
