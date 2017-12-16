@@ -1,10 +1,11 @@
 from collections import Counter
 from hashlib import md5
 from itertools import product
-from more_itertools import flatten
+from more_itertools import flatten, chunked
 from pprint import pformat
-from scipy.sparse import csr_matrix, save_npz, load_npz
+from scipy.sparse import csc_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
 from time import time
 from tqdm import tqdm
 import argparse
@@ -18,11 +19,11 @@ import re
 
 import lightgbm as lgbm
 
-from keras.engine.topology import Layer
-from keras.layers import Input, Embedding, Activation
-from keras.models import Model, load_model
-from keras.optimizers import Adagrad
-from keras import backend as K
+# from keras.engine.topology import Layer
+# from keras.layers import Input, Embedding, Activation
+# from keras.models import Model, load_model
+# from keras.optimizers import Adagrad
+# from keras import backend as K
 
 GBDT_PARAMS_DEFAULT = {
 
@@ -34,7 +35,7 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 450,
+    'num_iterations': 460,
     'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
@@ -65,7 +66,7 @@ INTERACTION_SPACE_PARAMS_DEFAULT = {
     'nb_dims': 50,
     'vecs_init_func': np.random.normal,
     'vecs_init_kwargs': {'loc': 0, 'scale': 0.05},
-    'optimizer': Adagrad,
+    # 'optimizer': Adagrad,
     'optimizer_kwargs': {'lr': 0.05},
     'nb_epochs_max': 10,
     'batch_size': 50000
@@ -315,7 +316,7 @@ class GBDTRec(object):
 
         S['song_musician_cat'] = musicians
         S['song_genre_cat'] = genres
-        S['song_genre_cat'] = S['song_genre_cat']
+        S['song_genre_cat'] = encoder(S['song_genre_cat'])
 
         # Count song, musician, genre plays.
         S['song_id_plays_con'] = S['song_id_cat'].apply(song_id_counter.get)
@@ -490,27 +491,6 @@ class GBDTRec(object):
             feats_base.to_csv(path_feats_base, index=False)
             self.logger.info('Completed in %d seconds' % (time() - t0))
 
-        # if not ready_feats_intr:
-        #     t0 = time()
-        #     self.logger.info('Engineering interaction features')
-        #     feats_base = pd.read_csv(path_feats_base)
-        #     feats_intr = self._get_interaction_features(feats_base)
-        #     feats_intr.to_csv(path_feats_intr, index=False)
-        #     self.logger.info('Completed in %d seconds' % (time() - t0))
-
-        # if feats_intr == None:
-        #     feats_intr = pd.read_csv(path_feats_intr)
-
-        # for c in feats_intr.columns:
-        #     if c.endswith('_cat'):
-        #         feats_intr[c] = feats_intr[c].astype('category')
-        # nb_trn = len(feats_intr) - sum(feats_intr['target'].isnull())
-
-        # if which == 'train':
-        #     return feats_intr.iloc[:nb_trn]
-        # elif which == 'test':
-        #     return feats_intr.iloc[nb_trn:]
-
         if feats_base is None:
             feats_base = pd.read_csv(path_feats_base)
         for c in feats_base.columns:
@@ -522,12 +502,65 @@ class GBDTRec(object):
         if which == 'train':
             return X.iloc[:nb_trn], y.iloc[:nb_trn]
         elif which == 'test':
-            return X.iloc[nb_trn:]
+            return X.iloc[:nb_trn], X.iloc[nb_trn:]
+
+    def _get_cold_start_subs(self, X_trn, X_tst):
+
+        t0 = time()
+        self.logger.info('Substituting cold-start users and songs')
+
+        # Combine train and test with relevant columns.
+        cols = ['user_id_cat', 'song_id_cat', 'user_city_cat', 'song_genre_cat']
+        cmb = X_trn[cols].append(X_tst[cols])
+
+        # User replacement using user-genre play counts.
+        cold_users = np.setdiff1d(X_tst['user_id_cat'], X_trn['user_id_cat'])
+        warm_users = np.setdiff1d(cmb['user_id_cat'], cold_users)
+        cols = ['user_id_cat', 'song_genre_cat']
+        counter = cmb[cols].groupby(cols).size()
+        data, rows, cols = [], [], []
+        for (user, genre), count in counter.iteritems():
+            rows.append(user)
+            cols.append(genre)
+            data.append(count)
+        uvecs = csc_matrix((data, (rows, cols)), dtype=np.uint32)
+        knn = NearestNeighbors(1, metric='cosine').fit(uvecs[warm_users])
+        nbrs = knn.kneighbors(uvecs[cold_users], return_distance=False)
+        lookup = {a: b for a, b in zip(cold_users, warm_users[nbrs[:, 0]])}
+        X_tst['user_id_cat'] = X_tst['user_id_cat'].replace(lookup).astype('category')
+        self.logger.info('Substituted %d cold-start users in %d seconds' % (len(cold_users), time() - t0))
+        cold_users = np.setdiff1d(X_tst['user_id_cat'], X_trn['user_id_cat'])
+        assert len(cold_users) == 0, cold_users
+
+        # Song replacement using song-city play counts.
+        # Have to chunk the KNN for memory.
+        t0 = time()
+        cold_songs = np.setdiff1d(X_tst['song_id_cat'], X_trn['song_id_cat'])
+        warm_songs = np.setdiff1d(cmb['song_id_cat'], cold_songs)
+        cols = ['song_id_cat', 'user_city_cat']
+        counter = cmb[cols].groupby(cols).size()
+        data, rows, cols = [], [], []
+        for (song, city), count in counter.iteritems():
+            rows.append(song)
+            cols.append(city)
+            data.append(count)
+        svecs = csc_matrix((data, (rows, cols)), dtype=np.uint16)
+        knn = NearestNeighbors(1, metric='cosine').fit(svecs[warm_songs].todense())
+        for cold_songs_ in tqdm(chunked(cold_songs, 1000)):
+            nbrs = knn.kneighbors(svecs[cold_songs_], return_distance=False)
+            lookup = {a: b for a, b in zip(cold_songs_, warm_songs[nbrs[:, 0]])}
+            X_tst['song_id_cat'] = X_tst['song_id_cat'].replace(lookup).astype('category')
+        self.logger.info('Substituted %d cold-start songs in %d seconds' % (len(cold_songs), time() - t0))
+        cold_songs = np.setdiff1d(X_tst['song_id_cat'], X_trn['song_id_cat'])
+        assert len(cold_songs) == 0, cold_songs
+
+        return X_tst
 
     def val(self, X, y, val_prop=0.2, gbdt_params=GBDT_PARAMS_DEFAULT):
 
         self.logger.info('Preparing datasets')
         X_trn, X_val, y_trn, y_val = train_test_split(X, y, test_size=val_prop, shuffle=False)
+        X_val = self._get_cold_start_subs(X_trn, X_val)
 
         self.logger.info('Converting dataset to lgbm format')
         gbdt_trn = lgbm.Dataset(X_trn, y_trn)
@@ -565,7 +598,11 @@ class GBDTRec(object):
             gbdt_params, train_set=gbdt_trn, valid_sets=[gbdt_trn],
             valid_names=['trn'], verbose_eval=10, callbacks=gbdt_cb)
 
-    def predict(self, X, gbdt_model, gbdt_params):
+    def predict(self, X_trn, X_tst, gbdt_model, gbdt_params):
+
+        pdb.set_trace()
+
+        X_tst = self._get_cold_start_subs(X_trn, X_tst)
 
         if type(gbdt_params) is str:
             with open(gbdt_params) as fp:
@@ -578,7 +615,7 @@ class GBDTRec(object):
         gbdt = lgbm.Booster(model_file=gbdt_model, silent=False)
 
         self.logger.info('Making predictions')
-        yp = gbdt.predict(X, num_iteration=gbdt.current_iteration())
+        yp = gbdt.predict(X_tst, num_iteration=gbdt.current_iteration())
         self.logger.info('Target mean = %.2lf' % yp.mean())
         df = pd.DataFrame({'id': np.arange(len(yp)), 'target': yp})
         submission_path = gbdt_model.replace('.txt', '-submission.csv')
@@ -586,63 +623,63 @@ class GBDTRec(object):
         self.logger.info('Saved predictions %s' % submission_path)
 
 
-class MaskedVecDot(Layer):
+# class MaskedVecDot(Layer):
 
-    def __init__(self, **kwargs):
-        super(MaskedVecDot, self).__init__(**kwargs)
+#     def __init__(self, **kwargs):
+#         super(MaskedVecDot, self).__init__(**kwargs)
 
-    def build(self, input_shape):
-        pass
+#     def build(self, input_shape):
+#         pass
 
-    def call(self, inputs):
-        VI_0, VI_1, V_0, V_1 = inputs
-        V_dot = K.sum(V_0 * V_1, axis=-1)
-        return V_dot * K.clip(VI_0 * VI_1, 0, 1)
+#     def call(self, inputs):
+#         VI_0, VI_1, V_0, V_1 = inputs
+#         V_dot = K.sum(V_0 * V_1, axis=-1)
+#         return V_dot * K.clip(VI_0 * VI_1, 0, 1)
 
-    def compute_output_shape(self, input_shape):
-        return input_shape[0]
+#     def compute_output_shape(self, input_shape):
+#         return input_shape[0]
 
 
-class InteractionSpaceModel(object):
+# class InteractionSpaceModel(object):
 
-    def __init__(self, nb_dims, nb_vecs, vecs_init_func, vecs_init_kwargs,
-                 optimizer, optimizer_kwargs, batch_size, nb_epochs_max):
-        self.nb_dims = nb_dims
-        self.nb_vecs = nb_vecs
-        self.vecs_init_func = vecs_init_func
-        self.vecs_init_kwargs = vecs_init_kwargs
-        self.optimizer = optimizer
-        self.optimizer_kwargs = optimizer_kwargs
-        self.batch_size = batch_size
-        self.nb_epochs_max = nb_epochs_max
-        self.net = self._get_net()
+#     def __init__(self, nb_dims, nb_vecs, vecs_init_func, vecs_init_kwargs,
+#                  optimizer, optimizer_kwargs, batch_size, nb_epochs_max):
+#         self.nb_dims = nb_dims
+#         self.nb_vecs = nb_vecs
+#         self.vecs_init_func = vecs_init_func
+#         self.vecs_init_kwargs = vecs_init_kwargs
+#         self.optimizer = optimizer
+#         self.optimizer_kwargs = optimizer_kwargs
+#         self.batch_size = batch_size
+#         self.nb_epochs_max = nb_epochs_max
+#         self.net = self._get_net()
 
-    def _get_net(self):
-        # Define, initialize vector space.
-        self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.nb_dims)})
-        Vw = self.vecs_init_func(**self.vecs_init_kwargs)
-        Vw[0] *= 0
-        V = Embedding(self.nb_vecs, self.nb_dims, name='vecs', weights=[Vw])
+#     def _get_net(self):
+#         # Define, initialize vector space.
+#         self.vecs_init_kwargs.update({'size': (self.nb_vecs, self.nb_dims)})
+#         Vw = self.vecs_init_func(**self.vecs_init_kwargs)
+#         Vw[0] *= 0
+#         V = Embedding(self.nb_vecs, self.nb_dims, name='vecs', weights=[Vw])
 
-        # Inputs and vector dot product.
-        VI_0, VI_1 = Input((1,)), Input((1,))
-        V_0, V_1 = V(VI_0), V(VI_1)
-        V_dot = MaskedVecDot()([VI_0, VI_1, V_0, V_1])
+#         # Inputs and vector dot product.
+#         VI_0, VI_1 = Input((1,)), Input((1,))
+#         V_0, V_1 = V(VI_0), V(VI_1)
+#         V_dot = MaskedVecDot()([VI_0, VI_1, V_0, V_1])
 
-        # Apply sigmoid activation for pseudo-classification.
-        clsf = Activation('sigmoid')(V_dot)
+#         # Apply sigmoid activation for pseudo-classification.
+#         clsf = Activation('sigmoid')(V_dot)
 
-        # Model with two inputs, out output.
-        return Model([VI_0, VI_1], clsf)
+#         # Model with two inputs, out output.
+#         return Model([VI_0, VI_1], clsf)
 
-    def fit(self, X, y):
-        opt = self.optimizer(**self.optimizer_kwargs)
-        self.net.compile(opt, loss='binary_crossentropy', metrics=['accuracy'])
-        self.net.fit([X[:, 0], X[:, 1]], y, batch_size=self.batch_size,
-                     epochs=self.nb_epochs_max)
+#     def fit(self, X, y):
+#         opt = self.optimizer(**self.optimizer_kwargs)
+#         self.net.compile(opt, loss='binary_crossentropy', metrics=['accuracy'])
+#         self.net.fit([X[:, 0], X[:, 1]], y, batch_size=self.batch_size,
+#                      epochs=self.nb_epochs_max)
 
-    def transform(self, X):
-        return self.net.predict([X[:, 0], X[:, 1]], batch_size=self.batch_size, verbose=True)
+#     def transform(self, X):
+#         return self.net.predict([X[:, 0], X[:, 1]], batch_size=self.batch_size, verbose=True)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -664,6 +701,6 @@ if __name__ == "__main__":
         rec.val(*rec.get_features('train'))
 
     if args['predict']:
-        rec.predict(X=rec.get_features('test'),
+        rec.predict(*rec.get_features('test'),
                     gbdt_model=args['model'],
                     gbdt_params=args['params'] or GBDT_PARAMS_DEFAULT)
