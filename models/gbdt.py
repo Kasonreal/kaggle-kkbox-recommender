@@ -30,12 +30,14 @@ GBDT_PARAMS_DEFAULT = {
     # Defining the task.
     'objective': 'binary',
     'boosting': 'gbdt',
-    'metric': 'auc',
+    'metric': ['auc', 'binary_logloss'],
     'train_metric': True,
+
+    'n_jobs': 5,
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 1350,
+    'num_iterations': 2000,
     'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
