@@ -35,17 +35,17 @@ GBDT_PARAMS_DEFAULT = {
 
     # How many learners to fit, and how long to continue without
     # improvement on the validation set.
-    'num_iterations': 460,
+    'num_iterations': 560,
     'early_stopping_rounds': 50,
 
     # TODO: explain these parameters.
-    'learning_rate': 0.3,
+    'learning_rate': 0.2,
     'max_bin': 255,
 
     # Constraints on the tree characteristics.
     # Generally larger values will fit better but may over-fit.
     'max_depth': 10,
-    'num_leaves': 108,
+    'num_leaves': 150,
 
     # Randomly select *bagging_fraction* of the data to fit a learner.
     # Perform bagging at every *bagging_freq* iterations.
@@ -560,7 +560,7 @@ class GBDTRec(object):
 
         self.logger.info('Preparing datasets')
         X_trn, X_val, y_trn, y_val = train_test_split(X, y, test_size=val_prop, shuffle=False)
-        X_val = self._get_cold_start_subs(X_trn, X_val)
+        # X_val = self._get_cold_start_subs(X_trn, X_val)
 
         self.logger.info('Converting dataset to lgbm format')
         gbdt_trn = lgbm.Dataset(X_trn, y_trn)
@@ -599,10 +599,6 @@ class GBDTRec(object):
             valid_names=['trn'], verbose_eval=10, callbacks=gbdt_cb)
 
     def predict(self, X_trn, X_tst, gbdt_model, gbdt_params):
-
-        pdb.set_trace()
-
-        X_tst = self._get_cold_start_subs(X_trn, X_tst)
 
         if type(gbdt_params) is str:
             with open(gbdt_params) as fp:
