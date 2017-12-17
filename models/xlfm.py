@@ -24,7 +24,7 @@ XLFM_PARAMS_DEFAULT = {
     'task': 'binary',
     'lr': 0.02,
     'lambda': 0.0002,
-    'epoch': 30,
+    'epoch': 25,
     'k': 10,
     'metric': 'acc'
 }
